@@ -23,7 +23,8 @@
 #>
 
 # Version History
-# 1.2.1 - JSON formatting polish, README spacing, newline consistency.
+# 1.2.2 - Reliable two-space JSON formatter with no behavioural changes.
+# 1.2.1 - README spacing and newline consistency.
 # 1.2.0 - Metadata synchronisation, README history, deterministic updates.
 
 [CmdletBinding()]
@@ -52,7 +53,7 @@ param
 
 #region Configuration
 
-$ScriptVersion = "1.2.1"
+$ScriptVersion = "1.2.2"
 $MaximumHistoryEntries = 25
 
 $ProjectContext = [PSCustomObject]@{
@@ -346,6 +347,144 @@ function Read-JsonFile
     }
 }
 
+function ConvertTo-JsonScalar
+{
+    [CmdletBinding()]
+    param
+    (
+        $Value
+    )
+
+    if ($null -eq $Value)
+    {
+        return "null"
+    }
+
+    return ($Value | ConvertTo-Json -Compress -Depth 100)
+}
+
+function Format-ProjectJsonValue
+{
+    [CmdletBinding()]
+    param
+    (
+        $Value,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(0, 100)]
+        [int]$IndentLevel
+    )
+
+    $Indent = "  " * $IndentLevel
+    $ChildIndent = "  " * ($IndentLevel + 1)
+
+    if ($null -eq $Value)
+    {
+        return "null"
+    }
+
+    if ($Value -is [string] -or
+        $Value -is [char] -or
+        $Value -is [bool] -or
+        $Value -is [byte] -or
+        $Value -is [sbyte] -or
+        $Value -is [int16] -or
+        $Value -is [uint16] -or
+        $Value -is [int32] -or
+        $Value -is [uint32] -or
+        $Value -is [int64] -or
+        $Value -is [uint64] -or
+        $Value -is [single] -or
+        $Value -is [double] -or
+        $Value -is [decimal] -or
+        $Value -is [datetime] -or
+        $Value -is [guid] -or
+        $Value -is [version])
+    {
+        return ConvertTo-JsonScalar -Value $Value
+    }
+
+    if ($Value -is [System.Collections.IDictionary])
+    {
+        $Keys = @($Value.Keys)
+
+        if ($Keys.Count -eq 0)
+        {
+            return "{}"
+        }
+
+        $Lines = @("{")
+
+        for ($Index = 0; $Index -lt $Keys.Count; $Index++)
+        {
+            $Key = [string]$Keys[$Index]
+            $FormattedKey = ConvertTo-JsonScalar -Value $Key
+            $FormattedValue = Format-ProjectJsonValue `
+                -Value $Value[$Keys[$Index]] `
+                -IndentLevel ($IndentLevel + 1)
+
+            $Comma = if ($Index -lt ($Keys.Count - 1)) { "," } else { "" }
+            $Lines += "$ChildIndent$FormattedKey`: $FormattedValue$Comma"
+        }
+
+        $Lines += "$Indent}"
+        return $Lines -join [Environment]::NewLine
+    }
+
+    if ($Value -is [System.Collections.IEnumerable] -and
+        $Value -isnot [string])
+    {
+        $Items = @($Value)
+
+        if ($Items.Count -eq 0)
+        {
+            return "[]"
+        }
+
+        $Lines = @("[")
+
+        for ($Index = 0; $Index -lt $Items.Count; $Index++)
+        {
+            $FormattedValue = Format-ProjectJsonValue `
+                -Value $Items[$Index] `
+                -IndentLevel ($IndentLevel + 1)
+
+            $Comma = if ($Index -lt ($Items.Count - 1)) { "," } else { "" }
+            $Lines += "$ChildIndent$FormattedValue$Comma"
+        }
+
+        $Lines += "$Indent]"
+        return $Lines -join [Environment]::NewLine
+    }
+
+    $Properties = @(
+        $Value.PSObject.Properties |
+            Where-Object { $_.MemberType -in @("NoteProperty", "Property") }
+    )
+
+    if ($Properties.Count -eq 0)
+    {
+        return ConvertTo-JsonScalar -Value $Value
+    }
+
+    $Lines = @("{")
+
+    for ($Index = 0; $Index -lt $Properties.Count; $Index++)
+    {
+        $Property = $Properties[$Index]
+        $FormattedName = ConvertTo-JsonScalar -Value $Property.Name
+        $FormattedValue = Format-ProjectJsonValue `
+            -Value $Property.Value `
+            -IndentLevel ($IndentLevel + 1)
+
+        $Comma = if ($Index -lt ($Properties.Count - 1)) { "," } else { "" }
+        $Lines += "$ChildIndent$FormattedName`: $FormattedValue$Comma"
+    }
+
+    $Lines += "$Indent}"
+    return $Lines -join [Environment]::NewLine
+}
+
 function ConvertTo-ProjectJson
 {
     [CmdletBinding()]
@@ -355,28 +494,11 @@ function ConvertTo-ProjectJson
         $InputObject
     )
 
-    $Json = $InputObject | ConvertTo-Json -Depth 100
+    $Json = Format-ProjectJsonValue `
+        -Value $InputObject `
+        -IndentLevel 0
 
-    $FormattedLines = foreach ($Line in ($Json -split '\r?\n'))
-    {
-        $IndentLength = $Line.Length - $Line.TrimStart().Length
-        $IndentLevel = [math]::Floor($IndentLength / 4)
-        $TrimmedLine = $Line.TrimStart()
-
-        if ($TrimmedLine -match '^"[^"]+"\s*:\s{2,}')
-        {
-            $TrimmedLine = [regex]::Replace(
-                $TrimmedLine,
-                '^("[^"]+"\s*:)\s+',
-                '$1 '
-            )
-        }
-
-        ('  ' * $IndentLevel) + $TrimmedLine
-    }
-
-    return ($FormattedLines -join [Environment]::NewLine) +
-        [Environment]::NewLine
+    return $Json.TrimEnd() + [Environment]::NewLine
 }
 
 function Write-TextFileUtf8NoBom
@@ -673,14 +795,14 @@ function Get-UpdatedReadmeContent
         Stop-ProjectRelease "README.md could not be read."
     }
 
-    $NewCurrentRelease = @"
-## Current Release
-
-Version: **$($ProjectContext.TargetTag)**
-
-Generated by `ProjectCreateRelease.ps1`.
-
-"@
+    $NewCurrentRelease = @(
+        "## Current Release"
+        ""
+        "Version: **$($ProjectContext.TargetTag)**"
+        ""
+        "Generated by `ProjectCreateRelease.ps1`."
+        ""
+    ) -join [Environment]::NewLine
 
     $CurrentReleasePattern =
         '(?ms)^## Current Release\s*.*?(?=^---\s*$|^## Release History\s*$)'
