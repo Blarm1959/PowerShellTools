@@ -67,7 +67,7 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.0.1"
+$ScriptVersion = "2.1.0"
 $MaximumHistoryEntries = 25
 
 $ReleaseManagedZipFiles = @(
@@ -1942,6 +1942,7 @@ function Invoke-PackageInstall
 
     if ($ProjectContext.DryRun)
     {
+        Write-Host "       Would validate: release metadata"
         Write-Host "       Would run: npm install"
         return
     }
