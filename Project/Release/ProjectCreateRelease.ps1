@@ -11,10 +11,12 @@
     Current implementation:
       - Validate the supplied project folder
       - Validate required project files
-      - Load and validate release.json
+      - Load and validate project metadata
       - Determine the target version
       - Synchronise release.json, package.json and build-info.json
       - Update README current release and release history
+      - Write deterministic UTF-8 files without BOM
+      - Restore original files if an update fails
       - Display a project summary
 
     ZIP creation will be added in the next phase.
@@ -46,68 +48,74 @@ param
 
 #region Configuration
 
-$ScriptVersion = "1.1.0"
+$ScriptVersion = "1.2.0"
 $MaximumHistoryEntries = 25
 
 $ProjectContext = [PSCustomObject]@{
-    ProjectFolder   = $ProjectFolder
-    ProjectName     = $null
-    Release         = $null
-    Package         = $null
-    BuildInfo       = $null
-    CurrentVersion  = $null
-    TargetVersion   = $null
-    TargetTag       = $null
-    ReleaseType     = $null
-    OutputFolder    = $Output
-    ZipFilename     = $null
-    DryRun          = [bool]$DryRun
-    Force           = [bool]$Force
-    NoZip           = [bool]$NoZip
-    ZipOnly         = [bool]$ZipOnly
+    ProjectFolder  = $ProjectFolder
+    ProjectName    = $null
+    Release        = $null
+    Package        = $null
+    BuildInfo      = $null
+    CurrentVersion = $null
+    TargetVersion  = $null
+    TargetTag      = $null
+    ReleaseType    = $null
+    OutputFolder   = $Output
+    ZipFilename    = $null
+    DryRun         = [bool]$DryRun
+    Force          = [bool]$Force
+    NoZip          = [bool]$NoZip
+    ZipOnly        = [bool]$ZipOnly
 }
+
+$ProjectFileOrder = @(
+    "release.json"
+    "package.json"
+    "build-info.json"
+    "README.md"
+)
 
 #endregion Configuration
 
-#region Console Helpers
+#region Console
 
-function Write-ProgressMessage
+function Write-Status
 {
     [CmdletBinding()]
     param
     (
         [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Message
-    )
+        [ValidateSet("Progress", "Success", "Warning", "Failure")]
+        [string]$Status,
 
-    Write-Host "[....] $Message"
-}
-
-function Write-Success
-{
-    [CmdletBinding()]
-    param
-    (
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Message
     )
 
-    Write-Host "[ OK ] $Message"
-}
+    switch ($Status)
+    {
+        "Progress"
+        {
+            Write-Host "[....] $Message"
+        }
 
-function Write-WarningMessage
-{
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Message
-    )
+        "Success"
+        {
+            Write-Host "[ OK ] $Message"
+        }
 
-    Write-Host "[WARN] $Message" -ForegroundColor Yellow
+        "Warning"
+        {
+            Write-Host "[WARN] $Message" -ForegroundColor Yellow
+        }
+
+        "Failure"
+        {
+            Write-Host "[FAIL] $Message" -ForegroundColor Red
+        }
+    }
 }
 
 function Stop-ProjectRelease
@@ -120,13 +128,9 @@ function Stop-ProjectRelease
         [string]$Message
     )
 
-    Write-Host "[FAIL] $Message" -ForegroundColor Red
+    Write-Status -Status Failure -Message $Message
     exit 1
 }
-
-#endregion Console Helpers
-
-#region Banner
 
 function Show-Banner
 {
@@ -141,7 +145,7 @@ function Show-Banner
     Write-Host ""
 }
 
-#endregion Banner
+#endregion Console
 
 #region Project Initialisation
 
@@ -183,12 +187,14 @@ function Initialize-Project
             "Unable to resolve project folder: $($ProjectContext.ProjectFolder)"
     }
 
-    Write-Success "Project folder: $($ProjectContext.ProjectFolder)"
+    Write-Status `
+        -Status Success `
+        -Message "Project folder: $($ProjectContext.ProjectFolder)"
 }
 
 #endregion Project Initialisation
 
-#region Project Validation
+#region Validation
 
 function Test-CommandLine
 {
@@ -201,9 +207,20 @@ function Test-CommandLine
 
     $VersionChoiceCount = 0
 
-    if ($Minor) { $VersionChoiceCount++ }
-    if ($Major) { $VersionChoiceCount++ }
-    if (-not [string]::IsNullOrWhiteSpace($Version)) { $VersionChoiceCount++ }
+    if ($Minor)
+    {
+        $VersionChoiceCount++
+    }
+
+    if ($Major)
+    {
+        $VersionChoiceCount++
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Version))
+    {
+        $VersionChoiceCount++
+    }
 
     if ($VersionChoiceCount -gt 1)
     {
@@ -225,14 +242,16 @@ function Test-CommandLine
 
     if (-not [string]::IsNullOrWhiteSpace($ProjectContext.OutputFolder))
     {
-        Write-WarningMessage `
-            "-Output is accepted but will not be used until ZIP creation is implemented."
+        Write-Status `
+            -Status Warning `
+            -Message "-Output is accepted but will not be used until ZIP creation is implemented."
     }
 
-    if (-not $ProjectContext.NoZip)
+    if (-not $ProjectContext.NoZip -and -not $ProjectContext.DryRun)
     {
-        Write-WarningMessage `
-            "ZIP creation is not yet implemented. Project files will still be updated."
+        Write-Status `
+            -Status Warning `
+            -Message "ZIP creation is not yet implemented. Project files will still be updated."
     }
 }
 
@@ -245,16 +264,11 @@ function Test-ProjectFiles
         [PSCustomObject]$ProjectContext
     )
 
-    Write-ProgressMessage "Validating required project files"
+    Write-Status `
+        -Status Progress `
+        -Message "Validating required project files"
 
-    $RequiredFiles = @(
-        "release.json"
-        "package.json"
-        "build-info.json"
-        "README.md"
-    )
-
-    foreach ($FileName in $RequiredFiles)
+    foreach ($FileName in $ProjectFileOrder)
     {
         $FilePath = Join-Path `
             -Path $ProjectContext.ProjectFolder `
@@ -265,7 +279,9 @@ function Test-ProjectFiles
             Stop-ProjectRelease "Missing required file: $FileName"
         }
 
-        Write-Success "Found: $FileName"
+        Write-Status `
+            -Status Success `
+            -Message "Found: $FileName"
     }
 }
 
@@ -292,9 +308,9 @@ function Test-SemanticVersion
     return [version]$Value
 }
 
-#endregion Project Validation
+#endregion Validation
 
-#region JSON Helpers
+#region File and JSON Helpers
 
 function Read-JsonFile
 {
@@ -335,10 +351,54 @@ function ConvertTo-ProjectJson
         $InputObject
     )
 
-    return ($InputObject | ConvertTo-Json -Depth 100) + [Environment]::NewLine
+    $Json = $InputObject | ConvertTo-Json -Depth 100
+
+    $FormattedLines = foreach ($Line in ($Json -split '\r?\n'))
+    {
+        $IndentLength = $Line.Length - $Line.TrimStart().Length
+        $IndentLevel = [math]::Floor($IndentLength / 4)
+        $TrimmedLine = $Line.TrimStart()
+
+        if ($TrimmedLine -match '^"[^"]+"\s*:\s{2,}')
+        {
+            $TrimmedLine = [regex]::Replace(
+                $TrimmedLine,
+                '^("[^"]+"\s*:)\s+',
+                '$1 '
+            )
+        }
+
+        ('  ' * $IndentLevel) + $TrimmedLine
+    }
+
+    return ($FormattedLines -join [Environment]::NewLine) +
+        [Environment]::NewLine
 }
 
-#endregion JSON Helpers
+function Write-TextFileUtf8NoBom
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Content
+    )
+
+    $Encoding = New-Object System.Text.UTF8Encoding($false)
+
+    [System.IO.File]::WriteAllText(
+        $Path,
+        $Content,
+        $Encoding
+    )
+}
+
+#endregion File and JSON Helpers
 
 #region Release Information
 
@@ -351,7 +411,9 @@ function Get-ReleaseInfo
         [PSCustomObject]$ProjectContext
     )
 
-    Write-ProgressMessage "Loading project metadata"
+    Write-Status `
+        -Status Progress `
+        -Message "Loading project metadata"
 
     $ReleasePath = Join-Path `
         -Path $ProjectContext.ProjectFolder `
@@ -408,7 +470,9 @@ function Get-ReleaseInfo
         -Value $ProjectContext.CurrentVersion `
         -Description "Current version")
 
-    Write-Success "Project metadata loaded"
+    Write-Status `
+        -Status Success `
+        -Message "Project metadata loaded"
 }
 
 #endregion Release Information
@@ -424,7 +488,9 @@ function Get-TargetVersion
         [PSCustomObject]$ProjectContext
     )
 
-    Write-ProgressMessage "Determining target version"
+    Write-Status `
+        -Status Progress `
+        -Message "Determining target version"
 
     $Current = Test-SemanticVersion `
         -Value $ProjectContext.CurrentVersion `
@@ -474,8 +540,9 @@ function Get-TargetVersion
     $ProjectContext.TargetTag =
         "v$($ProjectContext.TargetVersion)"
 
-    Write-Success `
-        "Target version: $($ProjectContext.TargetVersion) ($($ProjectContext.ReleaseType))"
+    Write-Status `
+        -Status Success `
+        -Message "Target version: $($ProjectContext.TargetVersion) ($($ProjectContext.ReleaseType))"
 }
 
 #endregion Version Handling
@@ -559,7 +626,7 @@ function Get-UpdatedMetadataContent
     Set-ObjectProperty `
         -InputObject $ProjectContext.BuildInfo `
         -Name "notes" `
-        -Value "Pending ProjectUpdate.ps1 build information."
+        -Value "Build information will be completed by ProjectUpdate.ps1."
 
     return @{
         "release.json" =
@@ -607,7 +674,8 @@ function Get-UpdatedReadmeContent
 
 Version: **$($ProjectContext.TargetTag)**
 
-Created by `CreateRelease.ps1`.
+Generated by `ProjectCreateRelease.ps1`.
+
 "@
 
     $CurrentReleasePattern =
@@ -618,7 +686,7 @@ Created by `CreateRelease.ps1`.
         $Readme = [regex]::Replace(
             $Readme,
             $CurrentReleasePattern,
-            $NewCurrentRelease + [Environment]::NewLine
+            $NewCurrentRelease
         )
     }
     else
@@ -627,9 +695,7 @@ Created by `CreateRelease.ps1`.
             "README.md is missing a valid '## Current Release' section."
     }
 
-    $HistoryHeadingPattern = '(?m)^## Release History\s*$'
-
-    if ($Readme -notmatch $HistoryHeadingPattern)
+    if ($Readme -notmatch '(?m)^## Release History\s*$')
     {
         Stop-ProjectRelease `
             "README.md is missing the '## Release History' section."
@@ -641,7 +707,6 @@ Created by `CreateRelease.ps1`.
     )
 
     $ExistingHistory = $HistoryMatch.Groups["History"].Value.Trim()
-
     $ExistingRows = @()
 
     foreach ($Line in ($ExistingHistory -split '\r?\n'))
@@ -665,7 +730,10 @@ Created by `CreateRelease.ps1`.
         }
     }
 
-    $HistoryRows = @($HistoryRows | Select-Object -First $MaximumHistoryEntries)
+    $HistoryRows = @(
+        $HistoryRows |
+            Select-Object -First $MaximumHistoryEntries
+    )
 
     $NewHistory = @(
         "## Release History"
@@ -703,73 +771,118 @@ function Set-ProjectFiles
 
     if ($ProjectContext.DryRun)
     {
-        Write-WarningMessage `
-            "Dry run: project files were not changed."
+        Write-Status `
+            -Status Warning `
+            -Message "Dry run: project files were not changed."
 
-        foreach ($FileName in $FileContents.Keys)
+        foreach ($FileName in $ProjectFileOrder)
         {
-            Write-Host "       Would update: $FileName"
+            if ($FileContents.ContainsKey($FileName))
+            {
+                Write-Host "       Would update: $FileName"
+            }
         }
 
         return
     }
 
-    Write-ProgressMessage "Updating project files"
-
     $Backups = @{}
 
     try
     {
-        foreach ($FileName in $FileContents.Keys)
+        foreach ($FileName in $ProjectFileOrder)
         {
+            if (-not $FileContents.ContainsKey($FileName))
+            {
+                continue
+            }
+
             $FilePath = Join-Path `
                 -Path $ProjectContext.ProjectFolder `
                 -ChildPath $FileName
 
             $Backups[$FileName] =
-                Get-Content -LiteralPath $FilePath -Raw -ErrorAction Stop
+                Get-Content `
+                    -LiteralPath $FilePath `
+                    -Raw `
+                    -ErrorAction Stop
         }
 
-        foreach ($FileName in $FileContents.Keys)
+        Write-Status `
+            -Status Progress `
+            -Message "Synchronising project metadata"
+
+        foreach ($FileName in @(
+            "release.json"
+            "package.json"
+            "build-info.json"
+        ))
         {
+            if (-not $FileContents.ContainsKey($FileName))
+            {
+                continue
+            }
+
             $FilePath = Join-Path `
                 -Path $ProjectContext.ProjectFolder `
                 -ChildPath $FileName
 
-            Set-Content `
-                -LiteralPath $FilePath `
-                -Value $FileContents[$FileName] `
-                -Encoding utf8 `
-                -NoNewline `
-                -ErrorAction Stop
+            Write-TextFileUtf8NoBom `
+                -Path $FilePath `
+                -Content $FileContents[$FileName]
 
-            Write-Success "Updated: $FileName"
+            Write-Status `
+                -Status Success `
+                -Message "Updated: $FileName"
+        }
+
+        if ($FileContents.ContainsKey("README.md"))
+        {
+            Write-Status `
+                -Status Progress `
+                -Message "Updating README"
+
+            $ReadmePath = Join-Path `
+                -Path $ProjectContext.ProjectFolder `
+                -ChildPath "README.md"
+
+            Write-TextFileUtf8NoBom `
+                -Path $ReadmePath `
+                -Content $FileContents["README.md"]
+
+            Write-Status `
+                -Status Success `
+                -Message "Updated: README.md"
         }
     }
     catch
     {
-        Write-WarningMessage `
-            "An update failed. Restoring original project files."
+        Write-Status `
+            -Status Warning `
+            -Message "An update failed. Restoring original project files."
 
-        foreach ($FileName in $Backups.Keys)
+        foreach ($FileName in $ProjectFileOrder)
         {
+            if (-not $Backups.ContainsKey($FileName))
+            {
+                continue
+            }
+
             try
             {
                 $FilePath = Join-Path `
                     -Path $ProjectContext.ProjectFolder `
                     -ChildPath $FileName
 
-                Set-Content `
-                    -LiteralPath $FilePath `
-                    -Value $Backups[$FileName] `
-                    -Encoding utf8 `
-                    -NoNewline `
-                    -ErrorAction Stop
+                Write-TextFileUtf8NoBom `
+                    -Path $FilePath `
+                    -Content $Backups[$FileName]
             }
             catch
             {
-                Write-WarningMessage `
-                    "Could not restore: $FileName"
+                Write-Status `
+                    -Status Warning `
+                    -Message "Could not restore: $FileName"
             }
         }
 
@@ -820,12 +933,22 @@ function Write-ProjectSummary
         [PSCustomObject]$ProjectContext
     )
 
+    $DryRunText =
+        if ($ProjectContext.DryRun)
+        {
+            "Yes"
+        }
+        else
+        {
+            "No"
+        }
+
     Write-Host ""
-    Write-Host "Project : $($ProjectContext.ProjectName)"
-    Write-Host "Current : $($ProjectContext.CurrentVersion)"
-    Write-Host "Target  : $($ProjectContext.TargetVersion)"
-    Write-Host "Type    : $($ProjectContext.ReleaseType)"
-    Write-Host "Dry Run : $($ProjectContext.DryRun)"
+    Write-Host "Project         : $($ProjectContext.ProjectName)"
+    Write-Host "Current Version : $($ProjectContext.CurrentVersion)"
+    Write-Host "Target Version  : $($ProjectContext.TargetVersion)"
+    Write-Host "Release Type    : $($ProjectContext.ReleaseType)"
+    Write-Host "Dry Run         : $DryRunText"
     Write-Host ""
 }
 
@@ -855,11 +978,15 @@ Write-ProjectSummary `
 
 if ($ProjectContext.DryRun)
 {
-    Write-Success "Dry run completed successfully."
+    Write-Status `
+        -Status Success `
+        -Message "Dry run completed successfully."
 }
 else
 {
-    Write-Success "Project release metadata updated successfully."
+    Write-Status `
+        -Status Success `
+        -Message "Project release metadata updated successfully."
 }
 
 #endregion Main
