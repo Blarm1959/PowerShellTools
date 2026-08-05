@@ -17,12 +17,14 @@
       - Update README current release and release history
       - Write deterministic UTF-8 files without BOM
       - Restore original files if an update fails
+      - Create and verify a complete project ZIP
+      - Support default Downloads output and -Output overrides
+      - Support -NoZip and -ZipOnly
       - Display a project summary
-
-    ZIP creation will be added in the next phase.
 #>
 
 # Version History
+# 1.3.0 - ZIP creation, verification, output handling, -NoZip and -ZipOnly.
 # 1.2.2 - Reliable two-space JSON formatter with no behavioural changes.
 # 1.2.1 - README spacing and newline consistency.
 # 1.2.0 - Metadata synchronisation, README history, deterministic updates.
@@ -53,7 +55,7 @@ param
 
 #region Configuration
 
-$ScriptVersion = "1.2.2"
+$ScriptVersion = "1.3.0"
 $MaximumHistoryEntries = 25
 
 $ProjectContext = [PSCustomObject]@{
@@ -68,6 +70,9 @@ $ProjectContext = [PSCustomObject]@{
     ReleaseType    = $null
     OutputFolder   = $Output
     ZipFilename    = $null
+    ZipPath        = $null
+    ZipSizeBytes   = $null
+    ZipEntryCount  = $null
     DryRun         = [bool]$DryRun
     Force          = [bool]$Force
     NoZip          = [bool]$NoZip
@@ -239,24 +244,17 @@ function Test-CommandLine
             "-NoZip and -ZipOnly cannot be used together."
     }
 
-    if ($ProjectContext.ZipOnly)
+    if ($ProjectContext.ZipOnly -and $VersionChoiceCount -gt 0)
     {
         Stop-ProjectRelease `
-            "-ZipOnly will become available when ZIP creation is implemented."
+            "-ZipOnly cannot be combined with -Minor, -Major or -Version."
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($ProjectContext.OutputFolder))
+    if ($ProjectContext.NoZip -and
+        -not [string]::IsNullOrWhiteSpace($ProjectContext.OutputFolder))
     {
-        Write-Status `
-            -Status Warning `
-            -Message "-Output is accepted but will not be used until ZIP creation is implemented."
-    }
-
-    if (-not $ProjectContext.NoZip -and -not $ProjectContext.DryRun)
-    {
-        Write-Status `
-            -Status Warning `
-            -Message "ZIP creation is not yet implemented. Project files will still be updated."
+        Stop-ProjectRelease `
+            "-Output cannot be used with -NoZip."
     }
 }
 
@@ -525,6 +523,368 @@ function Write-TextFileUtf8NoBom
 }
 
 #endregion File and JSON Helpers
+
+#region ZIP Output
+
+function Get-DefaultDownloadsFolder
+{
+    [CmdletBinding()]
+    param()
+
+    $DownloadsFolder = $null
+    $KnownFolderName =
+        "{374DE290-123F-4565-9164-39C4925E467B}"
+
+    try
+    {
+        $UserShellFoldersPath =
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+
+        $DownloadsFolder = (
+            Get-ItemProperty `
+                -LiteralPath $UserShellFoldersPath `
+                -Name $KnownFolderName `
+                -ErrorAction Stop
+        ).$KnownFolderName
+
+        if (-not [string]::IsNullOrWhiteSpace($DownloadsFolder))
+        {
+            $DownloadsFolder =
+                [Environment]::ExpandEnvironmentVariables($DownloadsFolder)
+        }
+    }
+    catch
+    {
+        $DownloadsFolder = $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DownloadsFolder))
+    {
+        $DownloadsFolder = Join-Path `
+            -Path ([Environment]::GetFolderPath("UserProfile")) `
+            -ChildPath "Downloads"
+    }
+
+    return [System.IO.Path]::GetFullPath($DownloadsFolder)
+}
+
+function Initialize-ZipOutput
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    if ($ProjectContext.NoZip)
+    {
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ProjectContext.OutputFolder))
+    {
+        $ProjectContext.OutputFolder =
+            Get-DefaultDownloadsFolder
+    }
+    else
+    {
+        try
+        {
+            $ProjectContext.OutputFolder =
+                [System.IO.Path]::GetFullPath(
+                    $ProjectContext.OutputFolder
+                )
+        }
+        catch
+        {
+            Stop-ProjectRelease `
+                "Output folder is invalid: $($ProjectContext.OutputFolder)"
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $ProjectContext.OutputFolder))
+    {
+        if ($ProjectContext.DryRun)
+        {
+            Write-Status `
+                -Status Warning `
+                -Message "Dry run: output folder would be created: $($ProjectContext.OutputFolder)"
+        }
+        else
+        {
+            try
+            {
+                [void](New-Item `
+                    -ItemType Directory `
+                    -Path $ProjectContext.OutputFolder `
+                    -Force `
+                    -ErrorAction Stop)
+
+                Write-Status `
+                    -Status Success `
+                    -Message "Created output folder: $($ProjectContext.OutputFolder)"
+            }
+            catch
+            {
+                Stop-ProjectRelease `
+                    "Unable to create output folder: $($ProjectContext.OutputFolder)"
+            }
+        }
+    }
+    elseif (-not (Test-Path `
+        -LiteralPath $ProjectContext.OutputFolder `
+        -PathType Container))
+    {
+        Stop-ProjectRelease `
+            "Output path is not a folder: $($ProjectContext.OutputFolder)"
+    }
+
+    $ProjectContext.ZipFilename =
+        "$($ProjectContext.ProjectName)-v$($ProjectContext.TargetVersion).zip"
+
+    $ProjectContext.ZipPath = Join-Path `
+        -Path $ProjectContext.OutputFolder `
+        -ChildPath $ProjectContext.ZipFilename
+
+    if ((Test-Path -LiteralPath $ProjectContext.ZipPath) -and
+        -not $ProjectContext.Force)
+    {
+        Stop-ProjectRelease `
+            "ZIP already exists: $($ProjectContext.ZipPath). Use -Force to replace it."
+    }
+}
+
+function Test-ZipExcludedPath
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$RelativePath,
+
+        [string]$ZipPath,
+
+        [string]$FullPath
+    )
+
+    if ($RelativePath -match '(^|[\\/])\.git([\\/]|$)')
+    {
+        return $true
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ZipPath) -and
+        -not [string]::IsNullOrWhiteSpace($FullPath))
+    {
+        if ([string]::Equals(
+            [System.IO.Path]::GetFullPath($FullPath),
+            [System.IO.Path]::GetFullPath($ZipPath),
+            [System.StringComparison]::OrdinalIgnoreCase
+        ))
+        {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function New-ReleaseZip
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    if ($ProjectContext.NoZip)
+    {
+        return
+    }
+
+    if ($ProjectContext.DryRun)
+    {
+        Write-Status `
+            -Status Warning `
+            -Message "Dry run: ZIP was not created."
+
+        Write-Host "       Would create: $($ProjectContext.ZipPath)"
+        return
+    }
+
+    Write-Status `
+        -Status Progress `
+        -Message "Creating release ZIP"
+
+    if (Test-Path -LiteralPath $ProjectContext.ZipPath)
+    {
+        if (-not $ProjectContext.Force)
+        {
+            throw "ZIP already exists: $($ProjectContext.ZipPath)"
+        }
+
+        Remove-Item `
+            -LiteralPath $ProjectContext.ZipPath `
+            -Force `
+            -ErrorAction Stop
+    }
+
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+
+    $ProjectRootName = $ProjectContext.ProjectName
+    $ProjectRootPath = $ProjectContext.ProjectFolder.TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+
+    $Directories = @(
+        Get-ChildItem `
+            -LiteralPath $ProjectRootPath `
+            -Directory `
+            -Recurse `
+            -Force `
+            -ErrorAction Stop |
+        Sort-Object FullName
+    )
+
+    $Files = @(
+        Get-ChildItem `
+            -LiteralPath $ProjectRootPath `
+            -File `
+            -Recurse `
+            -Force `
+            -ErrorAction Stop |
+        Sort-Object FullName
+    )
+
+    $Archive = $null
+
+    try
+    {
+        $Archive = [System.IO.Compression.ZipFile]::Open(
+            $ProjectContext.ZipPath,
+            [System.IO.Compression.ZipArchiveMode]::Create
+        )
+
+        [void]$Archive.CreateEntry("$ProjectRootName/")
+
+        foreach ($Directory in $Directories)
+        {
+            $RelativePath = $Directory.FullName.Substring(
+                $ProjectRootPath.Length
+            ).TrimStart('\', '/')
+
+            if (Test-ZipExcludedPath `
+                -RelativePath $RelativePath `
+                -ZipPath $ProjectContext.ZipPath `
+                -FullPath $Directory.FullName)
+            {
+                continue
+            }
+
+            $EntryName =
+                "$ProjectRootName/$($RelativePath.Replace('\', '/'))/"
+
+            [void]$Archive.CreateEntry($EntryName)
+        }
+
+        foreach ($File in $Files)
+        {
+            $RelativePath = $File.FullName.Substring(
+                $ProjectRootPath.Length
+            ).TrimStart('\', '/')
+
+            if (Test-ZipExcludedPath `
+                -RelativePath $RelativePath `
+                -ZipPath $ProjectContext.ZipPath `
+                -FullPath $File.FullName)
+            {
+                continue
+            }
+
+            $EntryName =
+                "$ProjectRootName/$($RelativePath.Replace('\', '/'))"
+
+            [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $Archive,
+                $File.FullName,
+                $EntryName,
+                [System.IO.Compression.CompressionLevel]::Optimal
+            )
+        }
+    }
+    finally
+    {
+        if ($null -ne $Archive)
+        {
+            $Archive.Dispose()
+        }
+    }
+
+    if (-not (Test-Path `
+        -LiteralPath $ProjectContext.ZipPath `
+        -PathType Leaf))
+    {
+        throw "ZIP was not created: $($ProjectContext.ZipPath)"
+    }
+
+    $ZipItem = Get-Item `
+        -LiteralPath $ProjectContext.ZipPath `
+        -ErrorAction Stop
+
+    if ($ZipItem.Length -le 0)
+    {
+        throw "ZIP is empty: $($ProjectContext.ZipPath)"
+    }
+
+    $VerificationArchive = $null
+
+    try
+    {
+        $VerificationArchive =
+            [System.IO.Compression.ZipFile]::OpenRead(
+                $ProjectContext.ZipPath
+            )
+
+        $ProjectContext.ZipEntryCount =
+            $VerificationArchive.Entries.Count
+
+        $RequiredReleaseEntry =
+            "$ProjectRootName/release.json"
+
+        $ReleaseEntry = $VerificationArchive.Entries |
+            Where-Object { $_.FullName -eq $RequiredReleaseEntry } |
+            Select-Object -First 1
+
+        if ($null -eq $ReleaseEntry)
+        {
+            throw "ZIP verification failed: release.json is missing."
+        }
+    }
+    finally
+    {
+        if ($null -ne $VerificationArchive)
+        {
+            $VerificationArchive.Dispose()
+        }
+    }
+
+    $ProjectContext.ZipSizeBytes = $ZipItem.Length
+
+    Write-Status `
+        -Status Success `
+        -Message "ZIP created: $($ProjectContext.ZipFilename)"
+
+    Write-Status `
+        -Status Success `
+        -Message "ZIP verified: $($ProjectContext.ZipEntryCount) entries"
+}
+
+#endregion ZIP Output
+
 
 #region Release Information
 
@@ -802,6 +1162,7 @@ function Get-UpdatedReadmeContent
         ""
         "Generated by `ProjectCreateRelease.ps1`."
         ""
+        ""
     ) -join [Environment]::NewLine
 
     $CurrentReleasePattern =
@@ -883,7 +1244,7 @@ function Get-UpdatedReadmeContent
 
 #region File Transaction
 
-function Set-ProjectFiles
+function Get-ProjectFileBackups
 {
     [CmdletBinding()]
     param
@@ -893,6 +1254,82 @@ function Set-ProjectFiles
 
         [Parameter(Mandatory = $true)]
         [hashtable]$FileContents
+    )
+
+    $Backups = @{}
+
+    foreach ($FileName in $ProjectFileOrder)
+    {
+        if (-not $FileContents.ContainsKey($FileName))
+        {
+            continue
+        }
+
+        $FilePath = Join-Path `
+            -Path $ProjectContext.ProjectFolder `
+            -ChildPath $FileName
+
+        $Backups[$FileName] =
+            Get-Content `
+                -LiteralPath $FilePath `
+                -Raw `
+                -ErrorAction Stop
+    }
+
+    return $Backups
+}
+
+function Restore-ProjectFiles
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Backups
+    )
+
+    foreach ($FileName in $ProjectFileOrder)
+    {
+        if (-not $Backups.ContainsKey($FileName))
+        {
+            continue
+        }
+
+        try
+        {
+            $FilePath = Join-Path `
+                -Path $ProjectContext.ProjectFolder `
+                -ChildPath $FileName
+
+            Write-TextFileUtf8NoBom `
+                -Path $FilePath `
+                -Content $Backups[$FileName]
+        }
+        catch
+        {
+            Write-Status `
+                -Status Warning `
+                -Message "Could not restore: $FileName"
+        }
+    }
+}
+
+function Set-ProjectFiles
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$FileContents,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Backups
     )
 
     if ($ProjectContext.DryRun)
@@ -912,28 +1349,8 @@ function Set-ProjectFiles
         return
     }
 
-    $Backups = @{}
-
     try
     {
-        foreach ($FileName in $ProjectFileOrder)
-        {
-            if (-not $FileContents.ContainsKey($FileName))
-            {
-                continue
-            }
-
-            $FilePath = Join-Path `
-                -Path $ProjectContext.ProjectFolder `
-                -ChildPath $FileName
-
-            $Backups[$FileName] =
-                Get-Content `
-                    -LiteralPath $FilePath `
-                    -Raw `
-                    -ErrorAction Stop
-        }
-
         Write-Status `
             -Status Progress `
             -Message "Synchronising project metadata"
@@ -987,30 +1404,9 @@ function Set-ProjectFiles
             -Status Warning `
             -Message "An update failed. Restoring original project files."
 
-        foreach ($FileName in $ProjectFileOrder)
-        {
-            if (-not $Backups.ContainsKey($FileName))
-            {
-                continue
-            }
-
-            try
-            {
-                $FilePath = Join-Path `
-                    -Path $ProjectContext.ProjectFolder `
-                    -ChildPath $FileName
-
-                Write-TextFileUtf8NoBom `
-                    -Path $FilePath `
-                    -Content $Backups[$FileName]
-            }
-            catch
-            {
-                Write-Status `
-                    -Status Warning `
-                    -Message "Could not restore: $FileName"
-            }
-        }
+        Restore-ProjectFiles `
+            -ProjectContext $ProjectContext `
+            -Backups $Backups
 
         Stop-ProjectRelease `
             "Project files could not be updated."
@@ -1030,7 +1426,45 @@ function New-ProjectRelease
         [PSCustomObject]$ProjectContext
     )
 
+    if ($ProjectContext.ZipOnly)
+    {
+        $ProjectContext.TargetVersion =
+            $ProjectContext.CurrentVersion
+
+        $ProjectContext.TargetTag =
+            if ([string]::IsNullOrWhiteSpace(
+                [string]$ProjectContext.Release.release.tag
+            ))
+            {
+                "v$($ProjectContext.CurrentVersion)"
+            }
+            else
+            {
+                [string]$ProjectContext.Release.release.tag
+            }
+
+        $ProjectContext.ReleaseType = "ZipOnly"
+
+        Initialize-ZipOutput `
+            -ProjectContext $ProjectContext
+
+        try
+        {
+            New-ReleaseZip `
+                -ProjectContext $ProjectContext
+        }
+        catch
+        {
+            Stop-ProjectRelease $_.Exception.Message
+        }
+
+        return
+    }
+
     Get-TargetVersion `
+        -ProjectContext $ProjectContext
+
+    Initialize-ZipOutput `
         -ProjectContext $ProjectContext
 
     $UpdatedFiles =
@@ -1041,14 +1475,87 @@ function New-ProjectRelease
         Get-UpdatedReadmeContent `
             -ProjectContext $ProjectContext
 
+    $Backups = @{}
+
+    if (-not $ProjectContext.DryRun)
+    {
+        try
+        {
+            $Backups = Get-ProjectFileBackups `
+                -ProjectContext $ProjectContext `
+                -FileContents $UpdatedFiles
+        }
+        catch
+        {
+            Stop-ProjectRelease `
+                "Original project files could not be backed up."
+        }
+    }
+
     Set-ProjectFiles `
         -ProjectContext $ProjectContext `
-        -FileContents $UpdatedFiles
+        -FileContents $UpdatedFiles `
+        -Backups $Backups
+
+    try
+    {
+        New-ReleaseZip `
+            -ProjectContext $ProjectContext
+    }
+    catch
+    {
+        if (-not $ProjectContext.DryRun -and $Backups.Count -gt 0)
+        {
+            Write-Status `
+                -Status Warning `
+                -Message "ZIP creation failed. Restoring original project files."
+
+            Restore-ProjectFiles `
+                -ProjectContext $ProjectContext `
+                -Backups $Backups
+        }
+
+        if (Test-Path -LiteralPath $ProjectContext.ZipPath)
+        {
+            Remove-Item `
+                -LiteralPath $ProjectContext.ZipPath `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+
+        Stop-ProjectRelease $_.Exception.Message
+    }
 }
 
 #endregion Release Creation
 
 #region Summary
+
+function Format-FileSize
+{
+    [CmdletBinding()]
+    param
+    (
+        [Nullable[long]]$Bytes
+    )
+
+    if ($null -eq $Bytes)
+    {
+        return $null
+    }
+
+    if ($Bytes -ge 1MB)
+    {
+        return "{0:N2} MB" -f ($Bytes / 1MB)
+    }
+
+    if ($Bytes -ge 1KB)
+    {
+        return "{0:N2} KB" -f ($Bytes / 1KB)
+    }
+
+    return "$Bytes bytes"
+}
 
 function Write-ProjectSummary
 {
@@ -1069,12 +1576,40 @@ function Write-ProjectSummary
             "No"
         }
 
+    $ZipText =
+        if ($ProjectContext.NoZip)
+        {
+            "No (-NoZip)"
+        }
+        elseif ($ProjectContext.DryRun)
+        {
+            "Would create"
+        }
+        else
+        {
+            "Yes"
+        }
+
     Write-Host ""
     Write-Host "Project         : $($ProjectContext.ProjectName)"
     Write-Host "Current Version : $($ProjectContext.CurrentVersion)"
     Write-Host "Target Version  : $($ProjectContext.TargetVersion)"
     Write-Host "Release Type    : $($ProjectContext.ReleaseType)"
     Write-Host "Dry Run         : $DryRunText"
+    Write-Host "ZIP             : $ZipText"
+
+    if (-not $ProjectContext.NoZip)
+    {
+        Write-Host "ZIP Path        : $($ProjectContext.ZipPath)"
+
+        if (-not $ProjectContext.DryRun -and
+            $null -ne $ProjectContext.ZipSizeBytes)
+        {
+            Write-Host "ZIP Size        : $(Format-FileSize -Bytes $ProjectContext.ZipSizeBytes)"
+            Write-Host "ZIP Entries     : $($ProjectContext.ZipEntryCount)"
+        }
+    }
+
     Write-Host ""
 }
 
@@ -1112,7 +1647,7 @@ else
 {
     Write-Status `
         -Status Success `
-        -Message "Project release metadata updated successfully."
+        -Message "Project release completed successfully."
 }
 
 #endregion Main
