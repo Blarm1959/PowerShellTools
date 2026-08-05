@@ -3,31 +3,44 @@
     Blarm Generic Project Release Creator
 
 .DESCRIPTION
-    Generic release creation tool used by all Blarm projects.
+    Creates and publishes a project release from one of three change sources:
 
-    The project folder is supplied by the project's local
-    CreateRelease.ps1 wrapper.
+      -Local
+          Uses changes already present in the local Git working folder.
 
-    Current implementation:
-      - Validate the supplied project folder
-      - Validate required project files
-      - Load and validate project metadata
-      - Determine the target version
-      - Synchronise release.json, package.json and build-info.json
-      - Update README current release and release history
-      - Write deterministic UTF-8 files without BOM
-      - Restore original files if an update fails
-      - Create and verify a complete project ZIP
-      - Support default Downloads output and -Output overrides
-      - Support -NoZip and -ZipOnly
-      - Display a project summary
+      -Zip
+          Finds the newest <Project>-Changes*.zip file in Windows Downloads,
+          imports only its changed files, and then continues as a local release.
+
+      -Dummy
+          Requires a clean working tree and creates a version-only release.
+
+    After the source changes are ready, the tool:
+      - validates the project
+      - calculates the target version
+      - updates release-managed version metadata
+      - updates README release history
+      - optionally runs npm install
+      - validates the resulting metadata
+      - commits the project changes
+      - records build information in a follow-up commit
+      - pushes the commits
+      - creates and pushes the Git tag
+
+    Change Packages are transport packages only. They must not be treated as
+    complete project or release ZIPs.
+
+.NOTES
+    Breaking change from v1.x:
+      The tool no longer creates release ZIPs. It now imports an optional
+      Change Package and publishes the resulting local working tree.
 #>
 
 # Version History
-# 1.3.0 - ZIP creation, verification, output handling, -NoZip and -ZipOnly.
-# 1.2.2 - Reliable two-space JSON formatter with no behavioural changes.
-# 1.2.1 - README spacing and newline consistency.
-# 1.2.0 - Metadata synchronisation, README history, deterministic updates.
+# 2.0.0 - Unified -Local, -Zip and -Dummy release sources; Git commit/tag/push.
+# 1.3.0 - Complete-project ZIP creation and verification.
+# 1.2.2 - Reliable two-space JSON formatter.
+# 1.2.0 - Metadata synchronisation and README release history.
 
 [CmdletBinding()]
 param
@@ -36,48 +49,38 @@ param
     [ValidateNotNullOrEmpty()]
     [string]$ProjectFolder,
 
+    [switch]$Local,
+
+    [switch]$Zip,
+
+    [switch]$Dummy,
+
     [switch]$Minor,
 
     [switch]$Major,
 
     [string]$Version,
 
-    [switch]$NoZip,
-
-    [switch]$ZipOnly,
-
-    [string]$Output,
-
-    [switch]$DryRun,
-
-    [switch]$Force
+    [switch]$DryRun
 )
 
 #region Configuration
 
-$ScriptVersion = "1.3.0"
+$ErrorActionPreference = "Stop"
+$ScriptVersion = "2.0.0"
 $MaximumHistoryEntries = 25
 
-$ProjectContext = [PSCustomObject]@{
-    ProjectFolder  = $ProjectFolder
-    ProjectName    = $null
-    Release        = $null
-    Package        = $null
-    BuildInfo      = $null
-    CurrentVersion = $null
-    TargetVersion  = $null
-    TargetTag      = $null
-    ReleaseType    = $null
-    OutputFolder   = $Output
-    ZipFilename    = $null
-    ZipPath        = $null
-    ZipSizeBytes   = $null
-    ZipEntryCount  = $null
-    DryRun         = [bool]$DryRun
-    Force          = [bool]$Force
-    NoZip          = [bool]$NoZip
-    ZipOnly        = [bool]$ZipOnly
-}
+$ReleaseManagedZipFiles = @(
+    "release.json"
+    "build-info.json"
+    "package-lock.json"
+)
+
+$ReleaseManagedZipFolders = @(
+    ".git"
+    ".vs"
+    "node_modules"
+)
 
 $ProjectFileOrder = @(
     "release.json"
@@ -85,6 +88,31 @@ $ProjectFileOrder = @(
     "build-info.json"
     "README.md"
 )
+
+$ProjectContext = [PSCustomObject]@{
+    ProjectFolder       = $ProjectFolder
+    ProjectName         = $null
+    Release             = $null
+    Package             = $null
+    BuildInfo           = $null
+    CurrentVersion      = $null
+    TargetVersion       = $null
+    TargetTag           = $null
+    ReleaseType         = $null
+    SourceMode          = $null
+    SourceZip           = $null
+    DownloadsFolder     = $null
+    ImportedFiles       = @()
+    IgnoredFiles        = @()
+    InitialGitChanges   = @()
+    CommitMessage       = $null
+    ReleaseHistoryNote  = $null
+    ContentCommit       = $null
+    FinalCommit         = $null
+    BuiltUtc            = $null
+    DryRun              = [bool]$DryRun
+    HasPackageJson      = $false
+}
 
 #endregion Configuration
 
@@ -108,12 +136,12 @@ function Write-Status
     {
         "Progress"
         {
-            Write-Host "[....] $Message"
+            Write-Host "[....] $Message" -ForegroundColor Cyan
         }
 
         "Success"
         {
-            Write-Host "[ OK ] $Message"
+            Write-Host "[ OK ] $Message" -ForegroundColor Green
         }
 
         "Warning"
@@ -138,7 +166,14 @@ function Stop-ProjectRelease
         [string]$Message
     )
 
-    Write-Status -Status Failure -Message $Message
+    Write-Host ""
+    Write-Host "=========================================================" -ForegroundColor Red
+    Write-Host " RELEASE FAILED" -ForegroundColor Red
+    Write-Host "=========================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host $Message -ForegroundColor Red
+    Write-Host ""
+
     exit 1
 }
 
@@ -157,7 +192,152 @@ function Show-Banner
 
 #endregion Console
 
-#region Project Initialisation
+#region Native Commands and Git
+
+function Invoke-NativeCommand
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Command,
+
+        [string[]]$Arguments = @()
+    )
+
+    & $Command @Arguments
+
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "'$Command $($Arguments -join ' ')' failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Get-GitStatus
+{
+    [CmdletBinding()]
+    param()
+
+    $Status = @(git.exe status --porcelain)
+
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "Unable to read Git status."
+    }
+
+    return $Status
+}
+
+function Get-GitHead
+{
+    [CmdletBinding()]
+    param()
+
+    $Head = (git.exe rev-parse HEAD).Trim()
+
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($Head))
+    {
+        throw "Unable to determine the current Git commit."
+    }
+
+    return $Head
+}
+
+function Test-GitRepository
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    $GitFolder = Join-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -ChildPath ".git"
+
+    if (-not (Test-Path -LiteralPath $GitFolder -PathType Container))
+    {
+        Stop-ProjectRelease `
+            "The project does not contain a .git folder."
+    }
+
+    try
+    {
+        Push-Location $ProjectContext.ProjectFolder
+
+        $InsideWorkTree = (
+            git.exe rev-parse --is-inside-work-tree
+        ).Trim()
+
+        if ($LASTEXITCODE -ne 0 -or $InsideWorkTree -ne "true")
+        {
+            throw "The project folder is not a Git working tree."
+        }
+    }
+    catch
+    {
+        Stop-ProjectRelease $_.Exception.Message
+    }
+    finally
+    {
+        Pop-Location
+    }
+
+    Write-Status `
+        -Status Success `
+        -Message "Git repository found"
+}
+
+function Test-TargetTagAvailable
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    try
+    {
+        Push-Location $ProjectContext.ProjectFolder
+
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @("fetch", "--tags", "--quiet")
+
+        $ExistingTag = git.exe tag --list $ProjectContext.TargetTag
+
+        if ($LASTEXITCODE -ne 0)
+        {
+            throw "Unable to check Git tags."
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace(
+            ($ExistingTag -join "").Trim()
+        ))
+        {
+            throw "Git tag '$($ProjectContext.TargetTag)' already exists."
+        }
+    }
+    catch
+    {
+        Stop-ProjectRelease $_.Exception.Message
+    }
+    finally
+    {
+        Pop-Location
+    }
+
+    Write-Status `
+        -Status Success `
+        -Message "Git tag is available: $($ProjectContext.TargetTag)"
+}
+
+#endregion Native Commands and Git
+
+#region Project Initialisation and Validation
 
 function Initialize-Project
 {
@@ -186,10 +366,11 @@ function Initialize-Project
 
     try
     {
-        $ProjectContext.ProjectFolder =
-            (Resolve-Path `
+        $ProjectContext.ProjectFolder = (
+            Resolve-Path `
                 -LiteralPath $ProjectContext.ProjectFolder `
-                -ErrorAction Stop).Path
+                -ErrorAction Stop
+        ).Path
     }
     catch
     {
@@ -202,10 +383,6 @@ function Initialize-Project
         -Message "Project folder: $($ProjectContext.ProjectFolder)"
 }
 
-#endregion Project Initialisation
-
-#region Validation
-
 function Test-CommandLine
 {
     [CmdletBinding()]
@@ -214,6 +391,29 @@ function Test-CommandLine
         [Parameter(Mandatory = $true)]
         [PSCustomObject]$ProjectContext
     )
+
+    $SourceCount = 0
+
+    if ($Local)
+    {
+        $SourceCount++
+    }
+
+    if ($Zip)
+    {
+        $SourceCount++
+    }
+
+    if ($Dummy)
+    {
+        $SourceCount++
+    }
+
+    if ($SourceCount -ne 1)
+    {
+        Stop-ProjectRelease `
+            "Specify exactly one change source: -Local, -Zip or -Dummy."
+    }
 
     $VersionChoiceCount = 0
 
@@ -238,23 +438,17 @@ function Test-CommandLine
             "Use only one of -Minor, -Major or -Version."
     }
 
-    if ($ProjectContext.NoZip -and $ProjectContext.ZipOnly)
+    if ($Local)
     {
-        Stop-ProjectRelease `
-            "-NoZip and -ZipOnly cannot be used together."
+        $ProjectContext.SourceMode = "Local"
     }
-
-    if ($ProjectContext.ZipOnly -and $VersionChoiceCount -gt 0)
+    elseif ($Zip)
     {
-        Stop-ProjectRelease `
-            "-ZipOnly cannot be combined with -Minor, -Major or -Version."
+        $ProjectContext.SourceMode = "Zip"
     }
-
-    if ($ProjectContext.NoZip -and
-        -not [string]::IsNullOrWhiteSpace($ProjectContext.OutputFolder))
+    else
     {
-        Stop-ProjectRelease `
-            "-Output cannot be used with -NoZip."
+        $ProjectContext.SourceMode = "Dummy"
     }
 }
 
@@ -311,7 +505,7 @@ function Test-SemanticVersion
     return [version]$Value
 }
 
-#endregion Validation
+#endregion Project Initialisation and Validation
 
 #region File and JSON Helpers
 
@@ -376,12 +570,8 @@ function Format-ProjectJsonValue
     $Indent = "  " * $IndentLevel
     $ChildIndent = "  " * ($IndentLevel + 1)
 
-    if ($null -eq $Value)
-    {
-        return "null"
-    }
-
-    if ($Value -is [string] -or
+    if ($null -eq $Value -or
+        $Value -is [string] -or
         $Value -is [char] -or
         $Value -is [bool] -or
         $Value -is [byte] -or
@@ -396,41 +586,64 @@ function Format-ProjectJsonValue
         $Value -is [double] -or
         $Value -is [decimal] -or
         $Value -is [datetime] -or
-        $Value -is [guid] -or
-        $Value -is [version])
+        $Value -is [guid])
     {
         return ConvertTo-JsonScalar -Value $Value
     }
 
     if ($Value -is [System.Collections.IDictionary])
     {
-        $Keys = @($Value.Keys)
+        $Entries = @($Value.GetEnumerator())
 
-        if ($Keys.Count -eq 0)
+        if ($Entries.Count -eq 0)
         {
             return "{}"
         }
 
-        $Lines = @("{")
+        $Lines = [System.Collections.Generic.List[string]]::new()
+        $Lines.Add("{")
 
-        for ($Index = 0; $Index -lt $Keys.Count; $Index++)
+        for ($Index = 0; $Index -lt $Entries.Count; $Index++)
         {
-            $Key = [string]$Keys[$Index]
-            $FormattedKey = ConvertTo-JsonScalar -Value $Key
+            $Entry = $Entries[$Index]
+            $NameJson = ConvertTo-JsonScalar -Value ([string]$Entry.Key)
             $FormattedValue = Format-ProjectJsonValue `
-                -Value $Value[$Keys[$Index]] `
+                -Value $Entry.Value `
                 -IndentLevel ($IndentLevel + 1)
 
-            $Comma = if ($Index -lt ($Keys.Count - 1)) { "," } else { "" }
-            $Lines += "$ChildIndent$FormattedKey`: $FormattedValue$Comma"
+            $ValueLines = $FormattedValue -split '\r?\n'
+            $Comma = if ($Index -lt ($Entries.Count - 1)) { "," } else { "" }
+
+            $Lines.Add("$ChildIndent$NameJson`: $($ValueLines[0])")
+
+            for ($LineIndex = 1; $LineIndex -lt $ValueLines.Count; $LineIndex++)
+            {
+                $Suffix = if ($LineIndex -eq ($ValueLines.Count - 1))
+                {
+                    $Comma
+                }
+                else
+                {
+                    ""
+                }
+
+                $Lines.Add("$($ValueLines[$LineIndex])$Suffix")
+            }
+
+            if ($ValueLines.Count -eq 1 -and $Comma)
+            {
+                $Lines[$Lines.Count - 1] =
+                    $Lines[$Lines.Count - 1] + $Comma
+            }
         }
 
-        $Lines += "$Indent}"
+        $Lines.Add("$Indent}")
         return $Lines -join [Environment]::NewLine
     }
 
     if ($Value -is [System.Collections.IEnumerable] -and
-        $Value -isnot [string])
+        $Value -isnot [string] -and
+        $Value -isnot [PSCustomObject])
     {
         $Items = @($Value)
 
@@ -439,47 +652,90 @@ function Format-ProjectJsonValue
             return "[]"
         }
 
-        $Lines = @("[")
+        $Lines = [System.Collections.Generic.List[string]]::new()
+        $Lines.Add("[")
 
         for ($Index = 0; $Index -lt $Items.Count; $Index++)
         {
-            $FormattedValue = Format-ProjectJsonValue `
+            $FormattedItem = Format-ProjectJsonValue `
                 -Value $Items[$Index] `
                 -IndentLevel ($IndentLevel + 1)
 
+            $ItemLines = $FormattedItem -split '\r?\n'
             $Comma = if ($Index -lt ($Items.Count - 1)) { "," } else { "" }
-            $Lines += "$ChildIndent$FormattedValue$Comma"
+
+            $Lines.Add("$ChildIndent$($ItemLines[0])")
+
+            for ($LineIndex = 1; $LineIndex -lt $ItemLines.Count; $LineIndex++)
+            {
+                $Suffix = if ($LineIndex -eq ($ItemLines.Count - 1))
+                {
+                    $Comma
+                }
+                else
+                {
+                    ""
+                }
+
+                $Lines.Add("$($ItemLines[$LineIndex])$Suffix")
+            }
+
+            if ($ItemLines.Count -eq 1 -and $Comma)
+            {
+                $Lines[$Lines.Count - 1] =
+                    $Lines[$Lines.Count - 1] + $Comma
+            }
         }
 
-        $Lines += "$Indent]"
+        $Lines.Add("$Indent]")
         return $Lines -join [Environment]::NewLine
     }
 
-    $Properties = @(
-        $Value.PSObject.Properties |
-            Where-Object { $_.MemberType -in @("NoteProperty", "Property") }
-    )
+    $Properties = @($Value.PSObject.Properties)
 
     if ($Properties.Count -eq 0)
     {
-        return ConvertTo-JsonScalar -Value $Value
+        return "{}"
     }
 
-    $Lines = @("{")
+    $Lines = [System.Collections.Generic.List[string]]::new()
+    $Lines.Add("{")
 
     for ($Index = 0; $Index -lt $Properties.Count; $Index++)
     {
         $Property = $Properties[$Index]
-        $FormattedName = ConvertTo-JsonScalar -Value $Property.Name
+        $NameJson = ConvertTo-JsonScalar -Value $Property.Name
         $FormattedValue = Format-ProjectJsonValue `
             -Value $Property.Value `
             -IndentLevel ($IndentLevel + 1)
 
+        $ValueLines = $FormattedValue -split '\r?\n'
         $Comma = if ($Index -lt ($Properties.Count - 1)) { "," } else { "" }
-        $Lines += "$ChildIndent$FormattedName`: $FormattedValue$Comma"
+
+        $Lines.Add("$ChildIndent$NameJson`: $($ValueLines[0])")
+
+        for ($LineIndex = 1; $LineIndex -lt $ValueLines.Count; $LineIndex++)
+        {
+            $Suffix = if ($LineIndex -eq ($ValueLines.Count - 1))
+            {
+                $Comma
+            }
+            else
+            {
+                ""
+            }
+
+            $Lines.Add("$($ValueLines[$LineIndex])$Suffix")
+        }
+
+        if ($ValueLines.Count -eq 1 -and $Comma)
+        {
+            $Lines[$Lines.Count - 1] =
+                $Lines[$Lines.Count - 1] + $Comma
+        }
     }
 
-    $Lines += "$Indent}"
+    $Lines.Add("$Indent}")
     return $Lines -join [Environment]::NewLine
 }
 
@@ -492,11 +748,11 @@ function ConvertTo-ProjectJson
         $InputObject
     )
 
-    $Json = Format-ProjectJsonValue `
-        -Value $InputObject `
-        -IndentLevel 0
-
-    return $Json.TrimEnd() + [Environment]::NewLine
+    return (
+        Format-ProjectJsonValue `
+            -Value $InputObject `
+            -IndentLevel 0
+    ).TrimEnd() + [Environment]::NewLine
 }
 
 function Write-TextFileUtf8NoBom
@@ -517,376 +773,44 @@ function Write-TextFileUtf8NoBom
 
     [System.IO.File]::WriteAllText(
         $Path,
-        $Content,
+        $Content.TrimEnd() + [Environment]::NewLine,
         $Encoding
     )
 }
 
-#endregion File and JSON Helpers
-
-#region ZIP Output
-
-function Get-DefaultDownloadsFolder
-{
-    [CmdletBinding()]
-    param()
-
-    $DownloadsFolder = $null
-    $KnownFolderName =
-        "{374DE290-123F-4565-9164-39C4925E467B}"
-
-    try
-    {
-        $UserShellFoldersPath =
-            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
-
-        $DownloadsFolder = (
-            Get-ItemProperty `
-                -LiteralPath $UserShellFoldersPath `
-                -Name $KnownFolderName `
-                -ErrorAction Stop
-        ).$KnownFolderName
-
-        if (-not [string]::IsNullOrWhiteSpace($DownloadsFolder))
-        {
-            $DownloadsFolder =
-                [Environment]::ExpandEnvironmentVariables($DownloadsFolder)
-        }
-    }
-    catch
-    {
-        $DownloadsFolder = $null
-    }
-
-    if ([string]::IsNullOrWhiteSpace($DownloadsFolder))
-    {
-        $DownloadsFolder = Join-Path `
-            -Path ([Environment]::GetFolderPath("UserProfile")) `
-            -ChildPath "Downloads"
-    }
-
-    return [System.IO.Path]::GetFullPath($DownloadsFolder)
-}
-
-function Initialize-ZipOutput
+function Set-ObjectProperty
 {
     [CmdletBinding()]
     param
     (
         [Parameter(Mandatory = $true)]
-        [PSCustomObject]$ProjectContext
+        $InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+
+        $Value
     )
 
-    if ($ProjectContext.NoZip)
-    {
-        return
-    }
+    $Property = $InputObject.PSObject.Properties[$Name]
 
-    if ([string]::IsNullOrWhiteSpace($ProjectContext.OutputFolder))
+    if ($null -eq $Property)
     {
-        $ProjectContext.OutputFolder =
-            Get-DefaultDownloadsFolder
+        $InputObject | Add-Member `
+            -MemberType NoteProperty `
+            -Name $Name `
+            -Value $Value
     }
     else
     {
-        try
-        {
-            $ProjectContext.OutputFolder =
-                [System.IO.Path]::GetFullPath(
-                    $ProjectContext.OutputFolder
-                )
-        }
-        catch
-        {
-            Stop-ProjectRelease `
-                "Output folder is invalid: $($ProjectContext.OutputFolder)"
-        }
-    }
-
-    if (-not (Test-Path -LiteralPath $ProjectContext.OutputFolder))
-    {
-        if ($ProjectContext.DryRun)
-        {
-            Write-Status `
-                -Status Warning `
-                -Message "Dry run: output folder would be created: $($ProjectContext.OutputFolder)"
-        }
-        else
-        {
-            try
-            {
-                [void](New-Item `
-                    -ItemType Directory `
-                    -Path $ProjectContext.OutputFolder `
-                    -Force `
-                    -ErrorAction Stop)
-
-                Write-Status `
-                    -Status Success `
-                    -Message "Created output folder: $($ProjectContext.OutputFolder)"
-            }
-            catch
-            {
-                Stop-ProjectRelease `
-                    "Unable to create output folder: $($ProjectContext.OutputFolder)"
-            }
-        }
-    }
-    elseif (-not (Test-Path `
-        -LiteralPath $ProjectContext.OutputFolder `
-        -PathType Container))
-    {
-        Stop-ProjectRelease `
-            "Output path is not a folder: $($ProjectContext.OutputFolder)"
-    }
-
-    $ProjectContext.ZipFilename =
-        "$($ProjectContext.ProjectName)-v$($ProjectContext.TargetVersion).zip"
-
-    $ProjectContext.ZipPath = Join-Path `
-        -Path $ProjectContext.OutputFolder `
-        -ChildPath $ProjectContext.ZipFilename
-
-    if ((Test-Path -LiteralPath $ProjectContext.ZipPath) -and
-        -not $ProjectContext.Force)
-    {
-        Stop-ProjectRelease `
-            "ZIP already exists: $($ProjectContext.ZipPath). Use -Force to replace it."
+        $InputObject.$Name = $Value
     }
 }
 
-function Test-ZipExcludedPath
-{
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]$RelativePath,
+#endregion File and JSON Helpers
 
-        [string]$ZipPath,
-
-        [string]$FullPath
-    )
-
-    if ($RelativePath -match '(^|[\\/])\.git([\\/]|$)')
-    {
-        return $true
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($ZipPath) -and
-        -not [string]::IsNullOrWhiteSpace($FullPath))
-    {
-        if ([string]::Equals(
-            [System.IO.Path]::GetFullPath($FullPath),
-            [System.IO.Path]::GetFullPath($ZipPath),
-            [System.StringComparison]::OrdinalIgnoreCase
-        ))
-        {
-            return $true
-        }
-    }
-
-    return $false
-}
-
-function New-ReleaseZip
-{
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [PSCustomObject]$ProjectContext
-    )
-
-    if ($ProjectContext.NoZip)
-    {
-        return
-    }
-
-    if ($ProjectContext.DryRun)
-    {
-        Write-Status `
-            -Status Warning `
-            -Message "Dry run: ZIP was not created."
-
-        Write-Host "       Would create: $($ProjectContext.ZipPath)"
-        return
-    }
-
-    Write-Status `
-        -Status Progress `
-        -Message "Creating release ZIP"
-
-    if (Test-Path -LiteralPath $ProjectContext.ZipPath)
-    {
-        if (-not $ProjectContext.Force)
-        {
-            throw "ZIP already exists: $($ProjectContext.ZipPath)"
-        }
-
-        Remove-Item `
-            -LiteralPath $ProjectContext.ZipPath `
-            -Force `
-            -ErrorAction Stop
-    }
-
-    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
-    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-
-    $ProjectRootName = $ProjectContext.ProjectName
-    $ProjectRootPath = $ProjectContext.ProjectFolder.TrimEnd(
-        [System.IO.Path]::DirectorySeparatorChar,
-        [System.IO.Path]::AltDirectorySeparatorChar
-    )
-
-    $Directories = @(
-        Get-ChildItem `
-            -LiteralPath $ProjectRootPath `
-            -Directory `
-            -Recurse `
-            -Force `
-            -ErrorAction Stop |
-        Sort-Object FullName
-    )
-
-    $Files = @(
-        Get-ChildItem `
-            -LiteralPath $ProjectRootPath `
-            -File `
-            -Recurse `
-            -Force `
-            -ErrorAction Stop |
-        Sort-Object FullName
-    )
-
-    $Archive = $null
-
-    try
-    {
-        $Archive = [System.IO.Compression.ZipFile]::Open(
-            $ProjectContext.ZipPath,
-            [System.IO.Compression.ZipArchiveMode]::Create
-        )
-
-        [void]$Archive.CreateEntry("$ProjectRootName/")
-
-        foreach ($Directory in $Directories)
-        {
-            $RelativePath = $Directory.FullName.Substring(
-                $ProjectRootPath.Length
-            ).TrimStart('\', '/')
-
-            if (Test-ZipExcludedPath `
-                -RelativePath $RelativePath `
-                -ZipPath $ProjectContext.ZipPath `
-                -FullPath $Directory.FullName)
-            {
-                continue
-            }
-
-            $EntryName =
-                "$ProjectRootName/$($RelativePath.Replace('\', '/'))/"
-
-            [void]$Archive.CreateEntry($EntryName)
-        }
-
-        foreach ($File in $Files)
-        {
-            $RelativePath = $File.FullName.Substring(
-                $ProjectRootPath.Length
-            ).TrimStart('\', '/')
-
-            if (Test-ZipExcludedPath `
-                -RelativePath $RelativePath `
-                -ZipPath $ProjectContext.ZipPath `
-                -FullPath $File.FullName)
-            {
-                continue
-            }
-
-            $EntryName =
-                "$ProjectRootName/$($RelativePath.Replace('\', '/'))"
-
-            [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                $Archive,
-                $File.FullName,
-                $EntryName,
-                [System.IO.Compression.CompressionLevel]::Optimal
-            )
-        }
-    }
-    finally
-    {
-        if ($null -ne $Archive)
-        {
-            $Archive.Dispose()
-        }
-    }
-
-    if (-not (Test-Path `
-        -LiteralPath $ProjectContext.ZipPath `
-        -PathType Leaf))
-    {
-        throw "ZIP was not created: $($ProjectContext.ZipPath)"
-    }
-
-    $ZipItem = Get-Item `
-        -LiteralPath $ProjectContext.ZipPath `
-        -ErrorAction Stop
-
-    if ($ZipItem.Length -le 0)
-    {
-        throw "ZIP is empty: $($ProjectContext.ZipPath)"
-    }
-
-    $VerificationArchive = $null
-
-    try
-    {
-        $VerificationArchive =
-            [System.IO.Compression.ZipFile]::OpenRead(
-                $ProjectContext.ZipPath
-            )
-
-        $ProjectContext.ZipEntryCount =
-            $VerificationArchive.Entries.Count
-
-        $RequiredReleaseEntry =
-            "$ProjectRootName/release.json"
-
-        $ReleaseEntry = $VerificationArchive.Entries |
-            Where-Object { $_.FullName -eq $RequiredReleaseEntry } |
-            Select-Object -First 1
-
-        if ($null -eq $ReleaseEntry)
-        {
-            throw "ZIP verification failed: release.json is missing."
-        }
-    }
-    finally
-    {
-        if ($null -ne $VerificationArchive)
-        {
-            $VerificationArchive.Dispose()
-        }
-    }
-
-    $ProjectContext.ZipSizeBytes = $ZipItem.Length
-
-    Write-Status `
-        -Status Success `
-        -Message "ZIP created: $($ProjectContext.ZipFilename)"
-
-    Write-Status `
-        -Status Success `
-        -Message "ZIP verified: $($ProjectContext.ZipEntryCount) entries"
-}
-
-#endregion ZIP Output
-
-
-#region Release Information
+#region Project Metadata
 
 function Get-ReleaseInfo
 {
@@ -956,14 +880,44 @@ function Get-ReleaseInfo
         -Value $ProjectContext.CurrentVersion `
         -Description "Current version")
 
+    $ProjectContext.HasPackageJson = Test-Path `
+        -LiteralPath $PackagePath `
+        -PathType Leaf
+
     Write-Status `
         -Status Success `
         -Message "Project metadata loaded"
 }
 
-#endregion Release Information
+function Refresh-ImportedProjectContent
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
 
-#region Version Handling
+    if ($ProjectContext.SourceMode -ne "Zip" -or
+        $ProjectContext.DryRun)
+    {
+        return
+    }
+
+    # package.json may contain genuine application changes from the Change
+    # Package. Reload it after import so those changes are preserved when the
+    # release-owned version field is updated.
+    $PackagePath = Join-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -ChildPath "package.json"
+
+    $ProjectContext.Package =
+        Read-JsonFile -Path $PackagePath -DisplayName "package.json"
+
+    Write-Status `
+        -Status Success `
+        -Message "Imported project metadata reloaded"
+}
 
 function Get-TargetVersion
 {
@@ -988,10 +942,10 @@ function Get-TargetVersion
             -Value $Version `
             -Description "Forced version"
 
-        if (-not $ProjectContext.Force -and $Forced -le $Current)
+        if ($Forced -le $Current)
         {
             Stop-ProjectRelease `
-                "Forced version must be greater than the current version. Use -Force to override."
+                "Forced version must be greater than the current version."
         }
 
         $ProjectContext.TargetVersion = $Forced.ToString()
@@ -1026,43 +980,44 @@ function Get-TargetVersion
     $ProjectContext.TargetTag =
         "v$($ProjectContext.TargetVersion)"
 
+    $ProjectContext.BuiltUtc =
+        (Get-Date).ToUniversalTime().ToString("o")
+
+    $ProjectContext.CommitMessage =
+        "Release $($ProjectContext.ProjectName) $($ProjectContext.TargetTag)"
+
+    if (-not [string]::IsNullOrWhiteSpace(
+        [string]$ProjectContext.Release.release.commit
+    ))
+    {
+        $ProjectContext.CommitMessage =
+            [string]$ProjectContext.Release.release.commit
+    }
+
+    switch ($ProjectContext.SourceMode)
+    {
+        "Local"
+        {
+            $ProjectContext.ReleaseHistoryNote =
+                "Released from local project changes."
+        }
+
+        "Zip"
+        {
+            $ProjectContext.ReleaseHistoryNote =
+                "Released from imported Change Package."
+        }
+
+        "Dummy"
+        {
+            $ProjectContext.ReleaseHistoryNote =
+                "Version-only test release."
+        }
+    }
+
     Write-Status `
         -Status Success `
         -Message "Target version: $($ProjectContext.TargetVersion) ($($ProjectContext.ReleaseType))"
-}
-
-#endregion Version Handling
-
-#region Metadata Synchronisation
-
-function Set-ObjectProperty
-{
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        $InputObject,
-
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name,
-
-        $Value
-    )
-
-    $Property = $InputObject.PSObject.Properties[$Name]
-
-    if ($null -eq $Property)
-    {
-        $InputObject | Add-Member `
-            -MemberType NoteProperty `
-            -Name $Name `
-            -Value $Value
-    }
-    else
-    {
-        $InputObject.$Name = $Value
-    }
 }
 
 function Get-UpdatedMetadataContent
@@ -1104,15 +1059,32 @@ function Get-UpdatedMetadataContent
         -Name "commit" `
         -Value ""
 
-    Set-ObjectProperty `
-        -InputObject $ProjectContext.BuildInfo `
-        -Name "builtUtc" `
-        -Value ""
+    if ($null -ne $ProjectContext.BuildInfo.PSObject.Properties["builtUtc"])
+    {
+        Set-ObjectProperty `
+            -InputObject $ProjectContext.BuildInfo `
+            -Name "builtUtc" `
+            -Value ""
+    }
+    elseif ($null -ne $ProjectContext.BuildInfo.PSObject.Properties["builtAt"])
+    {
+        Set-ObjectProperty `
+            -InputObject $ProjectContext.BuildInfo `
+            -Name "builtAt" `
+            -Value ""
+    }
+    else
+    {
+        Set-ObjectProperty `
+            -InputObject $ProjectContext.BuildInfo `
+            -Name "builtUtc" `
+            -Value ""
+    }
 
     Set-ObjectProperty `
         -InputObject $ProjectContext.BuildInfo `
         -Name "notes" `
-        -Value "Build information will be completed by ProjectUpdate.ps1."
+        -Value "Build information will be completed after the content commit."
 
     return @{
         "release.json" =
@@ -1126,7 +1098,147 @@ function Get-UpdatedMetadataContent
     }
 }
 
-#endregion Metadata Synchronisation
+function Set-ServiceWorkerVersion
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf))
+    {
+        return $false
+    }
+
+    $Content = Get-Content -LiteralPath $Path -Raw
+    $Original = $Content
+    $Lines = $Content -split "`r?`n"
+
+    for ($Index = 0; $Index -lt $Lines.Count; $Index++)
+    {
+        if ($Lines[$Index] -match '(?i)(cache|version)')
+        {
+            $Lines[$Index] = [regex]::Replace(
+                $Lines[$Index],
+                '(?i)v?\d+\.\d+\.\d+(?:-\d+)?',
+                $Version
+            )
+        }
+    }
+
+    $Content = ($Lines -join [Environment]::NewLine).TrimEnd() +
+        [Environment]::NewLine
+
+    if ($Content -ne $Original)
+    {
+        Write-TextFileUtf8NoBom -Path $Path -Content $Content
+        return $true
+    }
+
+    return $false
+}
+
+function Set-ManifestVersion
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf))
+    {
+        return $false
+    }
+
+    $Manifest = Read-JsonFile `
+        -Path $Path `
+        -DisplayName "manifest.json"
+
+    if ($null -eq $Manifest.PSObject.Properties["version"])
+    {
+        return $false
+    }
+
+    $Manifest.version = $Version
+
+    Write-TextFileUtf8NoBom `
+        -Path $Path `
+        -Content (ConvertTo-ProjectJson -InputObject $Manifest)
+
+    return $true
+}
+
+function Assert-ReleaseMetadata
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    $Problems = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($Name in @(
+        "release.json"
+        "package.json"
+        "build-info.json"
+    ))
+    {
+        $Path = Join-Path `
+            -Path $ProjectContext.ProjectFolder `
+            -ChildPath $Name
+
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf))
+        {
+            continue
+        }
+
+        $Json = Read-JsonFile -Path $Path -DisplayName $Name
+
+        $ActualVersion =
+            if ($Name -eq "release.json")
+            {
+                [string]$Json.release.version
+            }
+            else
+            {
+                [string]$Json.version
+            }
+
+        if ($ActualVersion -ne $ProjectContext.TargetVersion)
+        {
+            $Problems.Add(
+                "$Name version is '$ActualVersion' instead of '$($ProjectContext.TargetVersion)'."
+            )
+        }
+
+        if ($Name -eq "build-info.json" -and
+            [string]$Json.tag -ne $ProjectContext.TargetTag)
+        {
+            $Problems.Add(
+                "build-info.json tag is '$($Json.tag)' instead of '$($ProjectContext.TargetTag)'."
+            )
+        }
+    }
+
+    if ($Problems.Count -gt 0)
+    {
+        throw "Release metadata validation failed:`n - $($Problems -join "`n - ")"
+    }
+}
+
+#endregion Project Metadata
 
 #region README
 
@@ -1160,7 +1272,7 @@ function Get-UpdatedReadmeContent
         ""
         "Version: **$($ProjectContext.TargetTag)**"
         ""
-        "Generated by `ProjectCreateRelease.ps1`."
+        "Generated by ProjectCreateRelease.ps1."
         ""
         ""
     ) -join [Environment]::NewLine
@@ -1205,7 +1317,7 @@ function Get-UpdatedReadmeContent
     }
 
     $NewHistoryRow =
-        "| $($ProjectContext.TargetTag) | $($ProjectContext.ReleaseType) | Generated for updater regression testing. |"
+        "| $($ProjectContext.TargetTag) | $($ProjectContext.ReleaseType) | $($ProjectContext.ReleaseHistoryNote) |"
 
     $HistoryRows = @($NewHistoryRow)
 
@@ -1242,182 +1354,57 @@ function Get-UpdatedReadmeContent
 
 #endregion README
 
-#region File Transaction
+#region Change Source
 
-function Get-ProjectFileBackups
+function Get-WindowsDownloadsFolder
 {
     [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [PSCustomObject]$ProjectContext,
+    param()
 
-        [Parameter(Mandatory = $true)]
-        [hashtable]$FileContents
-    )
-
-    $Backups = @{}
-
-    foreach ($FileName in $ProjectFileOrder)
-    {
-        if (-not $FileContents.ContainsKey($FileName))
-        {
-            continue
-        }
-
-        $FilePath = Join-Path `
-            -Path $ProjectContext.ProjectFolder `
-            -ChildPath $FileName
-
-        $Backups[$FileName] =
-            Get-Content `
-                -LiteralPath $FilePath `
-                -Raw `
-                -ErrorAction Stop
-    }
-
-    return $Backups
-}
-
-function Restore-ProjectFiles
-{
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [PSCustomObject]$ProjectContext,
-
-        [Parameter(Mandatory = $true)]
-        [hashtable]$Backups
-    )
-
-    foreach ($FileName in $ProjectFileOrder)
-    {
-        if (-not $Backups.ContainsKey($FileName))
-        {
-            continue
-        }
-
-        try
-        {
-            $FilePath = Join-Path `
-                -Path $ProjectContext.ProjectFolder `
-                -ChildPath $FileName
-
-            Write-TextFileUtf8NoBom `
-                -Path $FilePath `
-                -Content $Backups[$FileName]
-        }
-        catch
-        {
-            Write-Status `
-                -Status Warning `
-                -Message "Could not restore: $FileName"
-        }
-    }
-}
-
-function Set-ProjectFiles
-{
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [PSCustomObject]$ProjectContext,
-
-        [Parameter(Mandatory = $true)]
-        [hashtable]$FileContents,
-
-        [Parameter(Mandatory = $true)]
-        [hashtable]$Backups
-    )
-
-    if ($ProjectContext.DryRun)
-    {
-        Write-Status `
-            -Status Warning `
-            -Message "Dry run: project files were not changed."
-
-        foreach ($FileName in $ProjectFileOrder)
-        {
-            if ($FileContents.ContainsKey($FileName))
-            {
-                Write-Host "       Would update: $FileName"
-            }
-        }
-
-        return
-    }
+    $DownloadsFolder = $null
+    $KnownFolderName =
+        "{374DE290-123F-4565-9164-39C4925E467B}"
 
     try
     {
-        Write-Status `
-            -Status Progress `
-            -Message "Synchronising project metadata"
+        $RegistryPath =
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
 
-        foreach ($FileName in @(
-            "release.json"
-            "package.json"
-            "build-info.json"
-        ))
+        $DownloadsFolder = (
+            Get-ItemProperty `
+                -LiteralPath $RegistryPath `
+                -Name $KnownFolderName `
+                -ErrorAction Stop
+        ).$KnownFolderName
+
+        if (-not [string]::IsNullOrWhiteSpace($DownloadsFolder))
         {
-            if (-not $FileContents.ContainsKey($FileName))
-            {
-                continue
-            }
-
-            $FilePath = Join-Path `
-                -Path $ProjectContext.ProjectFolder `
-                -ChildPath $FileName
-
-            Write-TextFileUtf8NoBom `
-                -Path $FilePath `
-                -Content $FileContents[$FileName]
-
-            Write-Status `
-                -Status Success `
-                -Message "Updated: $FileName"
-        }
-
-        if ($FileContents.ContainsKey("README.md"))
-        {
-            Write-Status `
-                -Status Progress `
-                -Message "Updating README"
-
-            $ReadmePath = Join-Path `
-                -Path $ProjectContext.ProjectFolder `
-                -ChildPath "README.md"
-
-            Write-TextFileUtf8NoBom `
-                -Path $ReadmePath `
-                -Content $FileContents["README.md"]
-
-            Write-Status `
-                -Status Success `
-                -Message "Updated: README.md"
+            $DownloadsFolder =
+                [Environment]::ExpandEnvironmentVariables($DownloadsFolder)
         }
     }
     catch
     {
-        Write-Status `
-            -Status Warning `
-            -Message "An update failed. Restoring original project files."
-
-        Restore-ProjectFiles `
-            -ProjectContext $ProjectContext `
-            -Backups $Backups
-
-        Stop-ProjectRelease `
-            "Project files could not be updated."
+        $DownloadsFolder = $null
     }
+
+    if ([string]::IsNullOrWhiteSpace($DownloadsFolder))
+    {
+        $DownloadsFolder = Join-Path `
+            -Path ([Environment]::GetFolderPath("UserProfile")) `
+            -ChildPath "Downloads"
+    }
+
+    if (-not (Test-Path -LiteralPath $DownloadsFolder -PathType Container))
+    {
+        Stop-ProjectRelease `
+            "Windows Downloads folder not found: $DownloadsFolder"
+    }
+
+    return [System.IO.Path]::GetFullPath($DownloadsFolder)
 }
 
-#endregion File Transaction
-
-#region Release Creation
-
-function New-ProjectRelease
+function Get-LatestChangePackage
 {
     [CmdletBinding()]
     param
@@ -1426,46 +1413,401 @@ function New-ProjectRelease
         [PSCustomObject]$ProjectContext
     )
 
-    if ($ProjectContext.ZipOnly)
+    $ProjectContext.DownloadsFolder =
+        Get-WindowsDownloadsFolder
+
+    $Pattern =
+        "$($ProjectContext.ProjectName)-Changes*.zip"
+
+    $Packages = @(
+        Get-ChildItem `
+            -LiteralPath $ProjectContext.DownloadsFolder `
+            -Filter $Pattern `
+            -File |
+        Sort-Object `
+            -Property LastWriteTime, Name `
+            -Descending
+    )
+
+    if ($Packages.Count -eq 0)
     {
-        $ProjectContext.TargetVersion =
-            $ProjectContext.CurrentVersion
+        Stop-ProjectRelease `
+            "No '$Pattern' file was found in $($ProjectContext.DownloadsFolder)"
+    }
 
-        $ProjectContext.TargetTag =
-            if ([string]::IsNullOrWhiteSpace(
-                [string]$ProjectContext.Release.release.tag
-            ))
-            {
-                "v$($ProjectContext.CurrentVersion)"
-            }
-            else
-            {
-                [string]$ProjectContext.Release.release.tag
-            }
+    $ProjectContext.SourceZip = $Packages[0]
 
-        $ProjectContext.ReleaseType = "ZipOnly"
+    Write-Status `
+        -Status Success `
+        -Message "Change Package found: $($ProjectContext.SourceZip.Name)"
+}
 
-        Initialize-ZipOutput `
-            -ProjectContext $ProjectContext
+function Test-ZipEntryPath
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$EntryPath
+    )
+
+    $Normalised = $EntryPath.Replace("\", "/")
+
+    if ($Normalised.StartsWith("/") -or
+        $Normalised -match '^[A-Za-z]:' -or
+        $Normalised -match '(^|/)\.\.(/|$)')
+    {
+        throw "Unsafe path in Change Package: $EntryPath"
+    }
+}
+
+function Get-ChangePackageRoot
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [string]$ExtractedFolder,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectName
+    )
+
+    $Items = @(
+        Get-ChildItem `
+            -LiteralPath $ExtractedFolder `
+            -Force
+    )
+
+    if ($Items.Count -eq 1 -and
+        $Items[0].PSIsContainer -and
+        $Items[0].Name -eq $ProjectName)
+    {
+        return $Items[0].FullName
+    }
+
+    return $ExtractedFolder
+}
+
+function Test-IgnoredChangePackagePath
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$RelativePath
+    )
+
+    $Normalised = $RelativePath.Replace("\", "/").TrimStart("/")
+    $Segments = @($Normalised -split "/")
+
+    if ($Segments.Count -eq 0)
+    {
+        return $false
+    }
+
+    if ($ReleaseManagedZipFolders -contains $Segments[0])
+    {
+        return $true
+    }
+
+    if ($Segments.Count -eq 1 -and
+        $ReleaseManagedZipFiles -contains $Segments[0])
+    {
+        return $true
+    }
+
+    return $false
+}
+
+function Import-ChangePackage
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    Get-LatestChangePackage `
+        -ProjectContext $ProjectContext
+
+    $TemporaryFolder = Join-Path `
+        -Path $env:TEMP `
+        -ChildPath (
+            "BlarmChangePackage-" +
+            [guid]::NewGuid().ToString("N")
+        )
+
+    try
+    {
+        [void](New-Item `
+            -ItemType Directory `
+            -Path $TemporaryFolder `
+            -Force)
+
+        Add-Type `
+            -AssemblyName System.IO.Compression.FileSystem `
+            -ErrorAction Stop
+
+        $Archive = $null
 
         try
         {
-            New-ReleaseZip `
-                -ProjectContext $ProjectContext
+            $Archive = [System.IO.Compression.ZipFile]::OpenRead(
+                $ProjectContext.SourceZip.FullName
+            )
+
+            if ($Archive.Entries.Count -eq 0)
+            {
+                throw "The Change Package is empty."
+            }
+
+            foreach ($Entry in $Archive.Entries)
+            {
+                Test-ZipEntryPath -EntryPath $Entry.FullName
+            }
         }
-        catch
+        finally
         {
-            Stop-ProjectRelease $_.Exception.Message
+            if ($null -ne $Archive)
+            {
+                $Archive.Dispose()
+            }
         }
 
-        return
+        Expand-Archive `
+            -LiteralPath $ProjectContext.SourceZip.FullName `
+            -DestinationPath $TemporaryFolder `
+            -Force
+
+        $PackageRoot = Get-ChangePackageRoot `
+            -ExtractedFolder $TemporaryFolder `
+            -ProjectName $ProjectContext.ProjectName
+
+        $Files = @(
+            Get-ChildItem `
+                -LiteralPath $PackageRoot `
+                -File `
+                -Recurse `
+                -Force |
+            Sort-Object FullName
+        )
+
+        if ($Files.Count -eq 0)
+        {
+            throw "The Change Package contains no files."
+        }
+
+        $ImportedFiles = [System.Collections.Generic.List[string]]::new()
+        $IgnoredFiles = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($File in $Files)
+        {
+            $RelativePath = $File.FullName.Substring(
+                $PackageRoot.Length
+            ).TrimStart("\", "/")
+
+            if (Test-IgnoredChangePackagePath `
+                -RelativePath $RelativePath)
+            {
+                $IgnoredFiles.Add($RelativePath)
+                continue
+            }
+
+            $DestinationPath = Join-Path `
+                -Path $ProjectContext.ProjectFolder `
+                -ChildPath $RelativePath
+
+            if ($ProjectContext.DryRun)
+            {
+                $ImportedFiles.Add($RelativePath)
+                continue
+            }
+
+            $DestinationFolder = Split-Path `
+                -Path $DestinationPath `
+                -Parent
+
+            if (-not (Test-Path `
+                -LiteralPath $DestinationFolder `
+                -PathType Container))
+            {
+                [void](New-Item `
+                    -ItemType Directory `
+                    -Path $DestinationFolder `
+                    -Force)
+            }
+
+            Copy-Item `
+                -LiteralPath $File.FullName `
+                -Destination $DestinationPath `
+                -Force
+
+            $ImportedFiles.Add($RelativePath)
+        }
+
+        $ProjectContext.ImportedFiles = @($ImportedFiles)
+        $ProjectContext.IgnoredFiles = @($IgnoredFiles)
+
+        foreach ($IgnoredFile in $ProjectContext.IgnoredFiles)
+        {
+            Write-Status `
+                -Status Warning `
+                -Message "Ignored release-managed file: $IgnoredFile"
+        }
+
+        if ($ProjectContext.ImportedFiles.Count -eq 0)
+        {
+            throw "The Change Package contained no importable changed files."
+        }
+
+        if ($ProjectContext.DryRun)
+        {
+            Write-Status `
+                -Status Warning `
+                -Message "Dry run: Change Package files were not copied."
+
+            foreach ($ImportedFile in $ProjectContext.ImportedFiles)
+            {
+                Write-Host "       Would import: $ImportedFile"
+            }
+        }
+        else
+        {
+            foreach ($ImportedFile in $ProjectContext.ImportedFiles)
+            {
+                Write-Status `
+                    -Status Success `
+                    -Message "Imported: $ImportedFile"
+            }
+        }
+    }
+    catch
+    {
+        Stop-ProjectRelease $_.Exception.Message
+    }
+    finally
+    {
+        if (Test-Path -LiteralPath $TemporaryFolder)
+        {
+            Remove-Item `
+                -LiteralPath $TemporaryFolder `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Initialize-ChangeSource
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    try
+    {
+        Push-Location $ProjectContext.ProjectFolder
+
+        $ProjectContext.InitialGitChanges =
+            @(Get-GitStatus)
+    }
+    catch
+    {
+        Stop-ProjectRelease $_.Exception.Message
+    }
+    finally
+    {
+        Pop-Location
     }
 
-    Get-TargetVersion `
-        -ProjectContext $ProjectContext
+    switch ($ProjectContext.SourceMode)
+    {
+        "Local"
+        {
+            if ($ProjectContext.InitialGitChanges.Count -eq 0)
+            {
+                Stop-ProjectRelease `
+                    "No local changes were found. Use -Dummy for a version-only release."
+            }
 
-    Initialize-ZipOutput `
-        -ProjectContext $ProjectContext
+            Write-Status `
+                -Status Success `
+                -Message "Local changes found: $($ProjectContext.InitialGitChanges.Count)"
+        }
+
+        "Zip"
+        {
+            if ($ProjectContext.InitialGitChanges.Count -gt 0)
+            {
+                Stop-ProjectRelease `
+                    "The Git working tree must be clean before importing a Change Package."
+            }
+
+            Import-ChangePackage `
+                -ProjectContext $ProjectContext
+
+            if (-not $ProjectContext.DryRun)
+            {
+                try
+                {
+                    Push-Location $ProjectContext.ProjectFolder
+                    $ImportedStatus = @(Get-GitStatus)
+                }
+                catch
+                {
+                    Stop-ProjectRelease $_.Exception.Message
+                }
+                finally
+                {
+                    Pop-Location
+                }
+
+                if ($ImportedStatus.Count -eq 0)
+                {
+                    Stop-ProjectRelease `
+                        "The Change Package produced no Git changes."
+                }
+
+                Write-Status `
+                    -Status Success `
+                    -Message "Imported changes detected by Git: $($ImportedStatus.Count)"
+            }
+        }
+
+        "Dummy"
+        {
+            if ($ProjectContext.InitialGitChanges.Count -gt 0)
+            {
+                Stop-ProjectRelease `
+                    "-Dummy requires a clean Git working tree."
+            }
+
+            Write-Status `
+                -Status Success `
+                -Message "Dummy version-only release selected"
+        }
+    }
+}
+
+#endregion Change Source
+
+#region Release File Updates
+
+function Set-ReleaseFiles
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
 
     $UpdatedFiles =
         Get-UpdatedMetadataContent `
@@ -1475,87 +1817,433 @@ function New-ProjectRelease
         Get-UpdatedReadmeContent `
             -ProjectContext $ProjectContext
 
-    $Backups = @{}
-
-    if (-not $ProjectContext.DryRun)
+    if ($ProjectContext.DryRun)
     {
-        try
+        Write-Status `
+            -Status Warning `
+            -Message "Dry run: release-managed files were not changed."
+
+        foreach ($FileName in $ProjectFileOrder)
         {
-            $Backups = Get-ProjectFileBackups `
-                -ProjectContext $ProjectContext `
-                -FileContents $UpdatedFiles
+            Write-Host "       Would update: $FileName"
         }
-        catch
+
+        $ServiceWorkerPath = Join-Path `
+            -Path $ProjectContext.ProjectFolder `
+            -ChildPath "service-worker.js"
+
+        if (Test-Path -LiteralPath $ServiceWorkerPath -PathType Leaf)
         {
-            Stop-ProjectRelease `
-                "Original project files could not be backed up."
+            Write-Host "       Would synchronise: service-worker.js"
         }
+
+        $ManifestPath = Join-Path `
+            -Path $ProjectContext.ProjectFolder `
+            -ChildPath "manifest.json"
+
+        if (Test-Path -LiteralPath $ManifestPath -PathType Leaf)
+        {
+            Write-Host "       Would synchronise: manifest.json"
+        }
+
+        return
     }
 
-    Set-ProjectFiles `
-        -ProjectContext $ProjectContext `
-        -FileContents $UpdatedFiles `
-        -Backups $Backups
+    Write-Status `
+        -Status Progress `
+        -Message "Synchronising release metadata"
 
-    try
+    foreach ($FileName in @(
+        "release.json"
+        "package.json"
+        "build-info.json"
+    ))
     {
-        New-ReleaseZip `
-            -ProjectContext $ProjectContext
+        $FilePath = Join-Path `
+            -Path $ProjectContext.ProjectFolder `
+            -ChildPath $FileName
+
+        Write-TextFileUtf8NoBom `
+            -Path $FilePath `
+            -Content $UpdatedFiles[$FileName]
+
+        Write-Status `
+            -Status Success `
+            -Message "Updated: $FileName"
     }
-    catch
+
+    Write-Status `
+        -Status Progress `
+        -Message "Updating README"
+
+    $ReadmePath = Join-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -ChildPath "README.md"
+
+    Write-TextFileUtf8NoBom `
+        -Path $ReadmePath `
+        -Content $UpdatedFiles["README.md"]
+
+    Write-Status `
+        -Status Success `
+        -Message "Updated: README.md"
+
+    $ServiceWorkerPath = Join-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -ChildPath "service-worker.js"
+
+    if (Set-ServiceWorkerVersion `
+        -Path $ServiceWorkerPath `
+        -Version $ProjectContext.TargetVersion)
     {
-        if (-not $ProjectContext.DryRun -and $Backups.Count -gt 0)
-        {
-            Write-Status `
-                -Status Warning `
-                -Message "ZIP creation failed. Restoring original project files."
-
-            Restore-ProjectFiles `
-                -ProjectContext $ProjectContext `
-                -Backups $Backups
-        }
-
-        if (Test-Path -LiteralPath $ProjectContext.ZipPath)
-        {
-            Remove-Item `
-                -LiteralPath $ProjectContext.ZipPath `
-                -Force `
-                -ErrorAction SilentlyContinue
-        }
-
-        Stop-ProjectRelease $_.Exception.Message
+        Write-Status `
+            -Status Success `
+            -Message "Updated: service-worker.js"
     }
+
+    $ManifestPath = Join-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -ChildPath "manifest.json"
+
+    if (Set-ManifestVersion `
+        -Path $ManifestPath `
+        -Version $ProjectContext.TargetVersion)
+    {
+        Write-Status `
+            -Status Success `
+            -Message "Updated: manifest.json"
+    }
+
+    Assert-ReleaseMetadata `
+        -ProjectContext $ProjectContext
+
+    Write-Status `
+        -Status Success `
+        -Message "Release metadata validated"
 }
 
-#endregion Release Creation
+#endregion Release File Updates
 
-#region Summary
+#region Package Handling
 
-function Format-FileSize
+function Invoke-PackageInstall
 {
     [CmdletBinding()]
     param
     (
-        [Nullable[long]]$Bytes
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
     )
 
-    if ($null -eq $Bytes)
+    if (-not $ProjectContext.HasPackageJson)
     {
-        return $null
+        return
     }
 
-    if ($Bytes -ge 1MB)
+    if ($ProjectContext.DryRun)
     {
-        return "{0:N2} MB" -f ($Bytes / 1MB)
+        Write-Host "       Would run: npm install"
+        return
     }
 
-    if ($Bytes -ge 1KB)
+    Write-Status `
+        -Status Progress `
+        -Message "Running npm install"
+
+    try
     {
-        return "{0:N2} KB" -f ($Bytes / 1KB)
+        Push-Location $ProjectContext.ProjectFolder
+
+        Invoke-NativeCommand `
+            -Command "npm.cmd" `
+            -Arguments @("install")
+    }
+    catch
+    {
+        Stop-ProjectRelease `
+            "npm install failed: $($_.Exception.Message)"
+    }
+    finally
+    {
+        Pop-Location
     }
 
-    return "$Bytes bytes"
+    Assert-ReleaseMetadata `
+        -ProjectContext $ProjectContext
+
+    Write-Status `
+        -Status Success `
+        -Message "npm install completed"
 }
+
+#endregion Package Handling
+
+#region Git Publication
+
+function Ensure-GitIgnoreEntry
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [string]$GitIgnorePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Entry
+    )
+
+    $Lines = @()
+
+    if (Test-Path -LiteralPath $GitIgnorePath -PathType Leaf)
+    {
+        $Lines = @(Get-Content -LiteralPath $GitIgnorePath)
+    }
+
+    if ($Lines -contains $Entry)
+    {
+        return
+    }
+
+    if ($Lines.Count -gt 0 -and
+        -not [string]::IsNullOrWhiteSpace($Lines[-1]))
+    {
+        $Lines += ""
+    }
+
+    $Lines += $Entry
+
+    [System.IO.File]::WriteAllLines(
+        $GitIgnorePath,
+        $Lines,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
+function Set-FinalBuildInfo
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    $BuildInfoPath = Join-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -ChildPath "build-info.json"
+
+    $BuildInfo = Read-JsonFile `
+        -Path $BuildInfoPath `
+        -DisplayName "build-info.json"
+
+    Set-ObjectProperty `
+        -InputObject $BuildInfo `
+        -Name "version" `
+        -Value $ProjectContext.TargetVersion
+
+    Set-ObjectProperty `
+        -InputObject $BuildInfo `
+        -Name "tag" `
+        -Value $ProjectContext.TargetTag
+
+    Set-ObjectProperty `
+        -InputObject $BuildInfo `
+        -Name "commit" `
+        -Value $ProjectContext.ContentCommit
+
+    if ($null -ne $BuildInfo.PSObject.Properties["builtUtc"])
+    {
+        Set-ObjectProperty `
+            -InputObject $BuildInfo `
+            -Name "builtUtc" `
+            -Value $ProjectContext.BuiltUtc
+    }
+    elseif ($null -ne $BuildInfo.PSObject.Properties["builtAt"])
+    {
+        Set-ObjectProperty `
+            -InputObject $BuildInfo `
+            -Name "builtAt" `
+            -Value $ProjectContext.BuiltUtc
+    }
+    else
+    {
+        Set-ObjectProperty `
+            -InputObject $BuildInfo `
+            -Name "builtUtc" `
+            -Value $ProjectContext.BuiltUtc
+    }
+
+    Set-ObjectProperty `
+        -InputObject $BuildInfo `
+        -Name "notes" `
+        -Value "Build information recorded by ProjectCreateRelease.ps1."
+
+    Write-TextFileUtf8NoBom `
+        -Path $BuildInfoPath `
+        -Content (ConvertTo-ProjectJson -InputObject $BuildInfo)
+}
+
+function Publish-ProjectRelease
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    if ($ProjectContext.DryRun)
+    {
+        Write-Status `
+            -Status Warning `
+            -Message "Dry run: Git commit, push and tag were not performed."
+
+        Write-Host "       Would commit: $($ProjectContext.CommitMessage)"
+        Write-Host "       Would tag: $($ProjectContext.TargetTag)"
+        Write-Host "       Would push commits and tag"
+        return
+    }
+
+    try
+    {
+        Push-Location $ProjectContext.ProjectFolder
+
+        Write-Status `
+            -Status Progress `
+            -Message "Preparing Git release"
+
+        $GitIgnorePath = Join-Path `
+            -Path $ProjectContext.ProjectFolder `
+            -ChildPath ".gitignore"
+
+        Ensure-GitIgnoreEntry `
+            -GitIgnorePath $GitIgnorePath `
+            -Entry ".vs/"
+
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @(
+                "rm"
+                "-r"
+                "--cached"
+                "--ignore-unmatch"
+                ".vs"
+            )
+
+        Assert-ReleaseMetadata `
+            -ProjectContext $ProjectContext
+
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @("add", "--all")
+
+        $PendingChanges = @(Get-GitStatus)
+
+        if ($PendingChanges.Count -eq 0)
+        {
+            throw "No Git changes remain to commit."
+        }
+
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @(
+                "commit"
+                "-m"
+                $ProjectContext.CommitMessage
+            )
+
+        Write-Status `
+            -Status Success `
+            -Message "Project changes committed"
+
+        $ProjectContext.ContentCommit =
+            Get-GitHead
+
+        Set-FinalBuildInfo `
+            -ProjectContext $ProjectContext
+
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @(
+                "add"
+                "--"
+                "build-info.json"
+            )
+
+        $BuildInfoChanges = @(
+            git.exe status --porcelain -- build-info.json
+        )
+
+        if ($LASTEXITCODE -ne 0)
+        {
+            throw "Unable to check build-info.json status."
+        }
+
+        if ($BuildInfoChanges.Count -gt 0)
+        {
+            Invoke-NativeCommand `
+                -Command "git.exe" `
+                -Arguments @(
+                    "commit"
+                    "-m"
+                    "Record build information for $($ProjectContext.TargetTag)"
+                )
+
+            Write-Status `
+                -Status Success `
+                -Message "Build information recorded"
+        }
+
+        $ProjectContext.FinalCommit =
+            Get-GitHead
+
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @("push")
+
+        Write-Status `
+            -Status Success `
+            -Message "Changes pushed"
+
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @(
+                "tag"
+                $ProjectContext.TargetTag
+            )
+
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @(
+                "push"
+                "origin"
+                $ProjectContext.TargetTag
+            )
+
+        Write-Status `
+            -Status Success `
+            -Message "Tag created and pushed: $($ProjectContext.TargetTag)"
+
+        $FinalStatus = @(Get-GitStatus)
+
+        if ($FinalStatus.Count -gt 0)
+        {
+            throw "The Git working tree is not clean after publishing."
+        }
+    }
+    catch
+    {
+        Stop-ProjectRelease $_.Exception.Message
+    }
+    finally
+    {
+        Pop-Location
+    }
+}
+
+#endregion Git Publication
+
+#region Summary
 
 function Write-ProjectSummary
 {
@@ -1576,38 +2264,42 @@ function Write-ProjectSummary
             "No"
         }
 
-    $ZipText =
-        if ($ProjectContext.NoZip)
-        {
-            "No (-NoZip)"
-        }
-        elseif ($ProjectContext.DryRun)
-        {
-            "Would create"
-        }
-        else
-        {
-            "Yes"
-        }
+    Write-Host ""
+    Write-Host "=========================================================" -ForegroundColor Green
 
+    if ($ProjectContext.DryRun)
+    {
+        Write-Host " RELEASE DRY RUN COMPLETE" -ForegroundColor Green
+    }
+    else
+    {
+        Write-Host " RELEASE COMPLETE" -ForegroundColor Green
+    }
+
+    Write-Host "=========================================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "Project         : $($ProjectContext.ProjectName)"
+    Write-Host "Source          : $($ProjectContext.SourceMode)"
+
+    if ($null -ne $ProjectContext.SourceZip)
+    {
+        Write-Host "Change Package  : $($ProjectContext.SourceZip.Name)"
+    }
+
     Write-Host "Current Version : $($ProjectContext.CurrentVersion)"
     Write-Host "Target Version  : $($ProjectContext.TargetVersion)"
     Write-Host "Release Type    : $($ProjectContext.ReleaseType)"
+    Write-Host "Tag             : $($ProjectContext.TargetTag)"
     Write-Host "Dry Run         : $DryRunText"
-    Write-Host "ZIP             : $ZipText"
 
-    if (-not $ProjectContext.NoZip)
+    if (-not [string]::IsNullOrWhiteSpace(
+        $ProjectContext.FinalCommit
+    ))
     {
-        Write-Host "ZIP Path        : $($ProjectContext.ZipPath)"
-
-        if (-not $ProjectContext.DryRun -and
-            $null -ne $ProjectContext.ZipSizeBytes)
-        {
-            Write-Host "ZIP Size        : $(Format-FileSize -Bytes $ProjectContext.ZipSizeBytes)"
-            Write-Host "ZIP Entries     : $($ProjectContext.ZipEntryCount)"
-        }
+        Write-Host "Commit          : $($ProjectContext.FinalCommit.Substring(
+            0,
+            [Math]::Min(12, $ProjectContext.FinalCommit.Length)
+        ))"
     }
 
     Write-Host ""
@@ -1617,37 +2309,54 @@ function Write-ProjectSummary
 
 #region Main
 
-Show-Banner
-
-Test-CommandLine `
-    -ProjectContext $ProjectContext
-
-Initialize-Project `
-    -ProjectContext $ProjectContext
-
-Test-ProjectFiles `
-    -ProjectContext $ProjectContext
-
-Get-ReleaseInfo `
-    -ProjectContext $ProjectContext
-
-New-ProjectRelease `
-    -ProjectContext $ProjectContext
-
-Write-ProjectSummary `
-    -ProjectContext $ProjectContext
-
-if ($ProjectContext.DryRun)
+try
 {
-    Write-Status `
-        -Status Success `
-        -Message "Dry run completed successfully."
+    Show-Banner
+
+    Test-CommandLine `
+        -ProjectContext $ProjectContext
+
+    Initialize-Project `
+        -ProjectContext $ProjectContext
+
+    Test-GitRepository `
+        -ProjectContext $ProjectContext
+
+    Test-ProjectFiles `
+        -ProjectContext $ProjectContext
+
+    Get-ReleaseInfo `
+        -ProjectContext $ProjectContext
+
+    Initialize-ChangeSource `
+        -ProjectContext $ProjectContext
+
+    Refresh-ImportedProjectContent `
+        -ProjectContext $ProjectContext
+
+    Get-TargetVersion `
+        -ProjectContext $ProjectContext
+
+    Test-TargetTagAvailable `
+        -ProjectContext $ProjectContext
+
+    Set-ReleaseFiles `
+        -ProjectContext $ProjectContext
+
+    Invoke-PackageInstall `
+        -ProjectContext $ProjectContext
+
+    Publish-ProjectRelease `
+        -ProjectContext $ProjectContext
+
+    Write-ProjectSummary `
+        -ProjectContext $ProjectContext
+
+    exit 0
 }
-else
+catch
 {
-    Write-Status `
-        -Status Success `
-        -Message "Project release completed successfully."
+    Stop-ProjectRelease $_.Exception.Message
 }
 
 #endregion Main
