@@ -22,6 +22,10 @@
     ZIP creation will be added in the next phase.
 #>
 
+# Version History
+# 1.2.1 - JSON formatting polish, README spacing, newline consistency.
+# 1.2.0 - Metadata synchronisation, README history, deterministic updates.
+
 [CmdletBinding()]
 param
 (
@@ -48,7 +52,7 @@ param
 
 #region Configuration
 
-$ScriptVersion = "1.2.0"
+$ScriptVersion = "1.2.1"
 $MaximumHistoryEntries = 25
 
 $ProjectContext = [PSCustomObject]@{
