@@ -2016,7 +2016,7 @@ function Set-FinalBuildInfo
     Set-ObjectProperty `
         -InputObject $BuildInfo `
         -Name "notes" `
-        -Value "Build information recorded by ProjectCreateRelease.ps1."
+        -Value "Build metadata recorded by ProjectCreateRelease.ps1."
 
     Write-TextFileUtf8NoBom `
         -Path $BuildInfoPath `
@@ -2126,7 +2126,7 @@ function Publish-ProjectRelease
                 -Arguments @(
                     "commit"
                     "-m"
-                    "Record build information for $($ProjectContext.TargetTag)"
+                    "Record build metadata for $($ProjectContext.TargetTag)"
                 )
 
             Write-Status `
