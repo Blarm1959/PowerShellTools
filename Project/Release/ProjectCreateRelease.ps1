@@ -67,7 +67,7 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.0.0"
+$ScriptVersion = "2.0.1"
 $MaximumHistoryEntries = 25
 
 $ReleaseManagedZipFiles = @(
@@ -1739,7 +1739,7 @@ function Initialize-ChangeSource
 
             Write-Status `
                 -Status Success `
-                -Message "Local changes found: $($ProjectContext.InitialGitChanges.Count)"
+                -Message "Release source: Local"
         }
 
         "Zip"
@@ -1777,7 +1777,7 @@ function Initialize-ChangeSource
 
                 Write-Status `
                     -Status Success `
-                    -Message "Imported changes detected by Git: $($ImportedStatus.Count)"
+                    -Message "Release source: Zip"
             }
         }
 
@@ -1791,7 +1791,7 @@ function Initialize-ChangeSource
 
             Write-Status `
                 -Status Success `
-                -Message "Dummy version-only release selected"
+                -Message "Release source: Dummy"
         }
     }
 }
