@@ -846,23 +846,12 @@ function Get-ReleaseInfo
     $ProjectContext.BuildInfo =
         Read-JsonFile -Path $BuildInfoPath -DisplayName "build-info.json"
 
-    if ($null -eq $ProjectContext.Release.project)
-    {
-        Stop-ProjectRelease `
-            "release.json is missing the project section."
-    }
-
-    if ($null -eq $ProjectContext.Release.release)
-    {
-        Stop-ProjectRelease `
-            "release.json is missing the release section."
-    }
-
+    
     $ProjectContext.ProjectName =
-        [string]$ProjectContext.Release.project.name
+        [string][string]$ProjectContext.Release.project
 
     $ProjectContext.CurrentVersion =
-        [string]$ProjectContext.Release.release.version
+        [string][string]$ProjectContext.Release.version
 
     if ([string]::IsNullOrWhiteSpace($ProjectContext.ProjectName))
     {
@@ -1030,13 +1019,13 @@ function Get-UpdatedMetadataContent
     )
 
     Set-ObjectProperty `
-        -InputObject $ProjectContext.Release.release `
+        -InputObject $ProjectContext.Release `
         -Name "version" `
         -Value $ProjectContext.TargetVersion
 
     Set-ObjectProperty `
-        -InputObject $ProjectContext.Release.release `
-        -Name "tag" `
+        -InputObject $ProjectContext.Release `
+        -Name "githubSource" `
         -Value $ProjectContext.TargetTag
 
     Set-ObjectProperty `
@@ -1209,7 +1198,7 @@ function Assert-ReleaseMetadata
         $ActualVersion =
             if ($Name -eq "release.json")
             {
-                [string]$Json.release.version
+                [string]$Json.version
             }
             else
             {
