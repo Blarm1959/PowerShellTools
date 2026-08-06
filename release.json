@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "project": "PowerShellTools",
+  "version": "1.0.1",
+  "githubSource": "v1.0.1",
+  "zipPrefix": "PowerShellTools-",
+  "port": 0,
+  "packageChanges": false,
+  "commit": "Release PowerShellTools v1.0.1",
+  "i18n": {
+    "enabled": false,
+    "folder": "src/i18n",
+    "masterLanguage": "en-GB",
+    "defaultLanguage": "en-GB",
+    "languages": [
+      "en-GB"
+    ]
+  }
+}

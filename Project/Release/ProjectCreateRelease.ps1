@@ -37,6 +37,7 @@
 #>
 
 # Version History
+# 2.4.0 - Added project bootstrap metadata and simplified explicit versioning.
 # 2.3.0 - Added complete -NoBump development commit support.
 # 2.0.0 - Unified -Local, -Zip and -Dummy release sources; Git commit/tag/push.
 # 1.3.0 - Complete-project ZIP creation and verification.
@@ -57,11 +58,6 @@ param
     [switch]$Dummy,
     [switch]$NoBump,
     [string]$Message,
-
-    [switch]$Minor,
-
-    [switch]$Major,
-
     [string]$Version,
 
     [switch]$DryRun
@@ -71,7 +67,12 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.3.0"
+$ScriptVersion = "2.4.0"
+$InitialVersion      = "0.0.1"
+$InitialReleaseType  = "Initial"
+$InitialReleaseNotes = "Initial project created."
+$DefaultPort         = 0
+$DefaultLanguage     = "en-GB"
 $MaximumHistoryEntries = 25
 
 $ReleaseManagedZipFiles = @(
@@ -88,7 +89,6 @@ $ReleaseManagedZipFolders = @(
 
 $ProjectFileOrder = @(
     "release.json"
-    "package.json"
     "build-info.json"
     "README.md"
 )
@@ -118,6 +118,8 @@ $ProjectContext = [PSCustomObject]@{
     Message             = $Message
     DryRun              = [bool]$DryRun
     HasPackageJson      = $false
+    IsNewProject        = $false
+    InitialVersion      = $InitialVersion
 }
 
 #endregion Configuration
@@ -273,16 +275,6 @@ function Test-GitRepository
         [PSCustomObject]$ProjectContext
     )
 
-    $GitFolder = Join-Path `
-        -Path $ProjectContext.ProjectFolder `
-        -ChildPath ".git"
-
-    if (-not (Test-Path -LiteralPath $GitFolder -PathType Container))
-    {
-        Stop-ProjectRelease `
-            "The project does not contain a .git folder."
-    }
-
     try
     {
         Push-Location $ProjectContext.ProjectFolder
@@ -293,7 +285,7 @@ function Test-GitRepository
 
         if ($LASTEXITCODE -ne 0 -or $InsideWorkTree -ne "true")
         {
-            throw "The project folder is not a Git working tree."
+            throw "The project folder is not inside a Git working tree."
         }
     }
     catch
@@ -435,7 +427,8 @@ function Test-CommandLine
         $ProjectContext.SourceMode = "Dummy"
     }
 
-    if ($ProjectContext.NoBump -and $ProjectContext.SourceMode -eq "Dummy")
+    if ($ProjectContext.NoBump -and
+        $ProjectContext.SourceMode -eq "Dummy")
     {
         Stop-ProjectRelease @"
 -NoBump cannot be combined with -Dummy.
@@ -444,25 +437,210 @@ function Test-CommandLine
 "@
     }
 
-    $VersionChoiceCount = 0
-    if ($Minor) { $VersionChoiceCount++ }
-    if ($Major) { $VersionChoiceCount++ }
-    if (-not [string]::IsNullOrWhiteSpace($Version)) { $VersionChoiceCount++ }
-
-    if ($VersionChoiceCount -gt 1)
+    if ($ProjectContext.NoBump -and
+        -not [string]::IsNullOrWhiteSpace($Version))
     {
-        Stop-ProjectRelease "Use only one of -Minor, -Major or -Version."
-    }
-
-    if ($ProjectContext.NoBump -and $VersionChoiceCount -gt 0)
-    {
-        Stop-ProjectRelease "-NoBump cannot be combined with -Minor, -Major or -Version."
+        Stop-ProjectRelease "-NoBump cannot be combined with -Version."
     }
 
     if (-not $ProjectContext.NoBump -and
         -not [string]::IsNullOrWhiteSpace($ProjectContext.Message))
     {
         Stop-ProjectRelease "-Message can only be used with -NoBump."
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Version))
+    {
+        [void](Test-SemanticVersion `
+            -Value $Version `
+            -Description "Version")
+
+        $ProjectContext.InitialVersion = $Version
+    }
+}
+
+function New-InitialReleaseJson
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    $ProjectName = Split-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -Leaf
+
+    return [ordered]@{
+        schemaVersion  = 1
+        project        = $ProjectName
+        version        = $ProjectContext.InitialVersion
+        githubSource   = "v$($ProjectContext.InitialVersion)"
+        zipPrefix      = "$ProjectName-"
+        port           = $DefaultPort
+        packageChanges = $false
+        commit         = "Release $ProjectName v$($ProjectContext.InitialVersion)"
+        i18n           = [ordered]@{
+            enabled         = $false
+            folder          = "src/i18n"
+            masterLanguage  = $DefaultLanguage
+            defaultLanguage = $DefaultLanguage
+            languages       = @($DefaultLanguage)
+        }
+    }
+}
+
+function New-InitialBuildInfoJson
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    return [ordered]@{
+        version  = $ProjectContext.InitialVersion
+        tag      = "v$($ProjectContext.InitialVersion)"
+        commit   = ""
+        builtUtc = ""
+        notes    = "Build metadata will be completed by ProjectCreateRelease.ps1."
+    }
+}
+
+function New-InitialReadmeContent
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    $ProjectName = Split-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -Leaf
+
+    return @(
+        "# $ProjectName"
+        ""
+        "Project documentation."
+        ""
+        "<!-- PROJECTCREATERELEASE:BEGIN -->"
+        ""
+        "## Release History"
+        ""
+        "| Version | Type | Notes |"
+        "|---------|------|-------|"
+        "| v$($ProjectContext.InitialVersion) | $InitialReleaseType | $InitialReleaseNotes |"
+        ""
+        "<!-- PROJECTCREATERELEASE:END -->"
+        ""
+    ) -join [Environment]::NewLine
+}
+
+function Initialize-ProjectMetadataFiles
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    $ReleasePath = Join-Path $ProjectContext.ProjectFolder "release.json"
+    $BuildInfoPath = Join-Path $ProjectContext.ProjectFolder "build-info.json"
+    $ReadmePath = Join-Path $ProjectContext.ProjectFolder "README.md"
+
+    $ProjectContext.IsNewProject = -not (
+        Test-Path -LiteralPath $ReleasePath -PathType Leaf
+    )
+
+    $Missing = @()
+    if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf)) { $Missing += "release.json" }
+    if (-not (Test-Path -LiteralPath $BuildInfoPath -PathType Leaf)) { $Missing += "build-info.json" }
+    if (-not (Test-Path -LiteralPath $ReadmePath -PathType Leaf)) { $Missing += "README.md" }
+
+    if ($Missing.Count -eq 0)
+    {
+        return
+    }
+
+    if ($ProjectContext.NoBump -and $ProjectContext.IsNewProject)
+    {
+        Stop-ProjectRelease `
+            "A new project must be initialised with a versioned release. Remove -NoBump."
+    }
+
+    if ($ProjectContext.SourceMode -eq "Dummy" -and $ProjectContext.IsNewProject)
+    {
+        Stop-ProjectRelease `
+            "A new project must be initialised from Local changes, not -Dummy."
+    }
+
+    Write-Status -Status Progress -Message "Initialising missing project metadata"
+
+    if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf))
+    {
+        if ($ProjectContext.DryRun)
+        {
+            Write-Host "       Would create: release.json"
+        }
+        else
+        {
+            Write-TextFileUtf8NoBom `
+                -Path $ReleasePath `
+                -Content (
+                    ConvertTo-ProjectJson `
+                        -InputObject (
+                            New-InitialReleaseJson -ProjectContext $ProjectContext
+                        )
+                )
+        }
+        Write-Status -Status Success -Message "Created: release.json"
+    }
+
+    if (-not (Test-Path -LiteralPath $BuildInfoPath -PathType Leaf))
+    {
+        if ($ProjectContext.DryRun)
+        {
+            Write-Host "       Would create: build-info.json"
+        }
+        else
+        {
+            Write-TextFileUtf8NoBom `
+                -Path $BuildInfoPath `
+                -Content (
+                    ConvertTo-ProjectJson `
+                        -InputObject (
+                            New-InitialBuildInfoJson -ProjectContext $ProjectContext
+                        )
+                )
+        }
+        Write-Status -Status Success -Message "Created: build-info.json"
+    }
+
+    if (-not (Test-Path -LiteralPath $ReadmePath -PathType Leaf))
+    {
+        if ($ProjectContext.DryRun)
+        {
+            Write-Host "       Would create: README.md"
+        }
+        else
+        {
+            Write-TextFileUtf8NoBom `
+                -Path $ReadmePath `
+                -Content (
+                    New-InitialReadmeContent -ProjectContext $ProjectContext
+                )
+        }
+        Write-Status -Status Success -Message "Created: README.md"
+    }
+
+    if ($ProjectContext.DryRun -and $ProjectContext.IsNewProject)
+    {
+        Write-Status -Status Warning -Message "Dry run: initial metadata files were not created."
     }
 }
 
@@ -474,6 +652,14 @@ function Test-ProjectFiles
         [Parameter(Mandatory = $true)]
         [PSCustomObject]$ProjectContext
     )
+
+    Initialize-ProjectMetadataFiles `
+        -ProjectContext $ProjectContext
+
+    if ($ProjectContext.DryRun -and $ProjectContext.IsNewProject)
+    {
+        return
+    }
 
     Write-Status `
         -Status Progress `
@@ -493,6 +679,13 @@ function Test-ProjectFiles
         Write-Status `
             -Status Success `
             -Message "Found: $FileName"
+    }
+
+    $PackagePath = Join-Path $ProjectContext.ProjectFolder "package.json"
+
+    if (Test-Path -LiteralPath $PackagePath -PathType Leaf)
+    {
+        Write-Status -Status Success -Message "Found optional file: package.json"
     }
 }
 
@@ -835,61 +1028,66 @@ function Get-ReleaseInfo
         [PSCustomObject]$ProjectContext
     )
 
-    Write-Status `
-        -Status Progress `
-        -Message "Loading project metadata"
+    if ($ProjectContext.DryRun -and $ProjectContext.IsNewProject)
+    {
+        $ProjectContext.ProjectName = Split-Path $ProjectContext.ProjectFolder -Leaf
+        $ProjectContext.CurrentVersion = $ProjectContext.InitialVersion
+        $ProjectContext.Release = [PSCustomObject](New-InitialReleaseJson -ProjectContext $ProjectContext)
+        $ProjectContext.BuildInfo = [PSCustomObject](New-InitialBuildInfoJson -ProjectContext $ProjectContext)
 
-    $ReleasePath = Join-Path `
-        -Path $ProjectContext.ProjectFolder `
-        -ChildPath "release.json"
+        $PackagePath = Join-Path $ProjectContext.ProjectFolder "package.json"
+        $ProjectContext.HasPackageJson = Test-Path -LiteralPath $PackagePath -PathType Leaf
+        if ($ProjectContext.HasPackageJson)
+        {
+            $ProjectContext.Package = Read-JsonFile -Path $PackagePath -DisplayName "package.json"
+        }
 
-    $PackagePath = Join-Path `
-        -Path $ProjectContext.ProjectFolder `
-        -ChildPath "package.json"
+        Write-Status -Status Success -Message "Dry run project metadata prepared"
+        return
+    }
 
-    $BuildInfoPath = Join-Path `
-        -Path $ProjectContext.ProjectFolder `
-        -ChildPath "build-info.json"
+    Write-Status -Status Progress -Message "Loading project metadata"
+
+    $ReleasePath = Join-Path $ProjectContext.ProjectFolder "release.json"
+    $PackagePath = Join-Path $ProjectContext.ProjectFolder "package.json"
+    $BuildInfoPath = Join-Path $ProjectContext.ProjectFolder "build-info.json"
 
     $ProjectContext.Release =
         Read-JsonFile -Path $ReleasePath -DisplayName "release.json"
 
-    $ProjectContext.Package =
-        Read-JsonFile -Path $PackagePath -DisplayName "package.json"
-
     $ProjectContext.BuildInfo =
         Read-JsonFile -Path $BuildInfoPath -DisplayName "build-info.json"
 
-    
-    $ProjectContext.ProjectName =
-        [string][string]$ProjectContext.Release.project
+    $ProjectContext.HasPackageJson = Test-Path -LiteralPath $PackagePath -PathType Leaf
 
-    $ProjectContext.CurrentVersion =
-        [string][string]$ProjectContext.Release.version
+    if ($ProjectContext.HasPackageJson)
+    {
+        $ProjectContext.Package =
+            Read-JsonFile -Path $PackagePath -DisplayName "package.json"
+    }
+    else
+    {
+        $ProjectContext.Package = $null
+    }
+
+    $ProjectContext.ProjectName = [string]$ProjectContext.Release.project
+    $ProjectContext.CurrentVersion = [string]$ProjectContext.Release.version
 
     if ([string]::IsNullOrWhiteSpace($ProjectContext.ProjectName))
     {
-        Stop-ProjectRelease `
-            "Project name was not found in release.json."
+        Stop-ProjectRelease "Project name was not found in release.json."
     }
 
     if ([string]::IsNullOrWhiteSpace($ProjectContext.CurrentVersion))
     {
-        Stop-ProjectRelease `
-            "Current version was not found in release.json."
+        Stop-ProjectRelease "Current version was not found in release.json."
     }
 
     [void](Test-SemanticVersion `
         -Value $ProjectContext.CurrentVersion `
         -Description "Current version")
 
-    $ProjectContext.HasPackageJson = Test-Path `
-        -LiteralPath $PackagePath `
-        -PathType Leaf
-
-    Write-Status `
-        -Status Success `
-        -Message "Project metadata loaded"
+    Write-Status -Status Success -Message "Project metadata loaded"
 }
 
 function Refresh-ImportedProjectContent
@@ -907,19 +1105,16 @@ function Refresh-ImportedProjectContent
         return
     }
 
-    # package.json may contain genuine application changes from the Change
-    # Package. Reload it after import so those changes are preserved when the
-    # release-owned version field is updated.
-    $PackagePath = Join-Path `
-        -Path $ProjectContext.ProjectFolder `
-        -ChildPath "package.json"
+    $PackagePath = Join-Path $ProjectContext.ProjectFolder "package.json"
+    $ProjectContext.HasPackageJson = Test-Path -LiteralPath $PackagePath -PathType Leaf
 
-    $ProjectContext.Package =
-        Read-JsonFile -Path $PackagePath -DisplayName "package.json"
+    if ($ProjectContext.HasPackageJson)
+    {
+        $ProjectContext.Package =
+            Read-JsonFile -Path $PackagePath -DisplayName "package.json"
+    }
 
-    Write-Status `
-        -Status Success `
-        -Message "Imported project metadata reloaded"
+    Write-Status -Status Success -Message "Imported project metadata reloaded"
 }
 
 function Get-TargetVersion
@@ -953,42 +1148,29 @@ function Get-TargetVersion
         return
     }
 
-    Write-Status `
-        -Status Progress `
-        -Message "Determining target version"
+    Write-Status -Status Progress -Message "Determining target version"
 
     $Current = Test-SemanticVersion `
         -Value $ProjectContext.CurrentVersion `
         -Description "Current version"
 
-    if (-not [string]::IsNullOrWhiteSpace($Version))
+    if ($ProjectContext.IsNewProject)
     {
-        $Forced = Test-SemanticVersion `
-            -Value $Version `
-            -Description "Forced version"
+        $ProjectContext.TargetVersion = $ProjectContext.InitialVersion
+        $ProjectContext.ReleaseType = $InitialReleaseType
+        $ProjectContext.ReleaseHistoryNote = $InitialReleaseNotes
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($Version))
+    {
+        $Explicit = Test-SemanticVersion -Value $Version -Description "Version"
 
-        if ($Forced -le $Current)
+        if ($Explicit -le $Current)
         {
-            Stop-ProjectRelease `
-                "Forced version must be greater than the current version."
+            Stop-ProjectRelease "Version must be greater than the current version."
         }
 
-        $ProjectContext.TargetVersion = $Forced.ToString()
-        $ProjectContext.ReleaseType = "Forced"
-    }
-    elseif ($Major)
-    {
-        $ProjectContext.TargetVersion =
-            ([version]::new($Current.Major + 1, 0, 0)).ToString()
-
-        $ProjectContext.ReleaseType = "Major"
-    }
-    elseif ($Minor)
-    {
-        $ProjectContext.TargetVersion =
-            ([version]::new($Current.Major, $Current.Minor + 1, 0)).ToString()
-
-        $ProjectContext.ReleaseType = "Minor"
+        $ProjectContext.TargetVersion = $Explicit.ToString()
+        $ProjectContext.ReleaseType = "Explicit"
     }
     else
     {
@@ -1002,41 +1184,24 @@ function Get-TargetVersion
         $ProjectContext.ReleaseType = "Patch"
     }
 
-    $ProjectContext.TargetTag =
-        "v$($ProjectContext.TargetVersion)"
-
-    $ProjectContext.BuiltUtc =
-        (Get-Date).ToUniversalTime().ToString("o")
-
+    $ProjectContext.TargetTag = "v$($ProjectContext.TargetVersion)"
+    $ProjectContext.BuiltUtc = (Get-Date).ToUniversalTime().ToString("o")
     $ProjectContext.CommitMessage =
         "Release $($ProjectContext.ProjectName) $($ProjectContext.TargetTag)"
 
-    if (-not [string]::IsNullOrWhiteSpace(
-        [string]$ProjectContext.Release.release.commit
-    ))
+    if ($null -ne $ProjectContext.Release -and
+        -not [string]::IsNullOrWhiteSpace([string]$ProjectContext.Release.commit))
     {
-        $ProjectContext.CommitMessage =
-            [string]$ProjectContext.Release.release.commit
+        $ProjectContext.CommitMessage = [string]$ProjectContext.Release.commit
     }
 
-    switch ($ProjectContext.SourceMode)
+    if (-not $ProjectContext.IsNewProject)
     {
-        "Local"
+        switch ($ProjectContext.SourceMode)
         {
-            $ProjectContext.ReleaseHistoryNote =
-                "Released from local project changes."
-        }
-
-        "Zip"
-        {
-            $ProjectContext.ReleaseHistoryNote =
-                "Released from imported Change Package."
-        }
-
-        "Dummy"
-        {
-            $ProjectContext.ReleaseHistoryNote =
-                "Version-only test release."
+            "Local" { $ProjectContext.ReleaseHistoryNote = "Released from local project changes." }
+            "Zip"   { $ProjectContext.ReleaseHistoryNote = "Released from imported Change Package." }
+            "Dummy" { $ProjectContext.ReleaseHistoryNote = "Version-only test release." }
         }
     }
 
@@ -1054,56 +1219,29 @@ function Get-UpdatedMetadataContent
         [PSCustomObject]$ProjectContext
     )
 
-    Set-ObjectProperty `
-        -InputObject $ProjectContext.Release `
-        -Name "version" `
-        -Value $ProjectContext.TargetVersion
+    Set-ObjectProperty -InputObject $ProjectContext.Release -Name "version" -Value $ProjectContext.TargetVersion
+    Set-ObjectProperty -InputObject $ProjectContext.Release -Name "githubSource" -Value $ProjectContext.TargetTag
 
-    Set-ObjectProperty `
-        -InputObject $ProjectContext.Release `
-        -Name "githubSource" `
-        -Value $ProjectContext.TargetTag
+    if ($ProjectContext.HasPackageJson -and $null -ne $ProjectContext.Package)
+    {
+        Set-ObjectProperty -InputObject $ProjectContext.Package -Name "version" -Value $ProjectContext.TargetVersion
+    }
 
-    Set-ObjectProperty `
-        -InputObject $ProjectContext.Package `
-        -Name "version" `
-        -Value $ProjectContext.TargetVersion
-
-    Set-ObjectProperty `
-        -InputObject $ProjectContext.BuildInfo `
-        -Name "version" `
-        -Value $ProjectContext.TargetVersion
-
-    Set-ObjectProperty `
-        -InputObject $ProjectContext.BuildInfo `
-        -Name "tag" `
-        -Value $ProjectContext.TargetTag
-
-    Set-ObjectProperty `
-        -InputObject $ProjectContext.BuildInfo `
-        -Name "commit" `
-        -Value ""
+    Set-ObjectProperty -InputObject $ProjectContext.BuildInfo -Name "version" -Value $ProjectContext.TargetVersion
+    Set-ObjectProperty -InputObject $ProjectContext.BuildInfo -Name "tag" -Value $ProjectContext.TargetTag
+    Set-ObjectProperty -InputObject $ProjectContext.BuildInfo -Name "commit" -Value ""
 
     if ($null -ne $ProjectContext.BuildInfo.PSObject.Properties["builtUtc"])
     {
-        Set-ObjectProperty `
-            -InputObject $ProjectContext.BuildInfo `
-            -Name "builtUtc" `
-            -Value ""
+        Set-ObjectProperty -InputObject $ProjectContext.BuildInfo -Name "builtUtc" -Value ""
     }
     elseif ($null -ne $ProjectContext.BuildInfo.PSObject.Properties["builtAt"])
     {
-        Set-ObjectProperty `
-            -InputObject $ProjectContext.BuildInfo `
-            -Name "builtAt" `
-            -Value ""
+        Set-ObjectProperty -InputObject $ProjectContext.BuildInfo -Name "builtAt" -Value ""
     }
     else
     {
-        Set-ObjectProperty `
-            -InputObject $ProjectContext.BuildInfo `
-            -Name "builtUtc" `
-            -Value ""
+        Set-ObjectProperty -InputObject $ProjectContext.BuildInfo -Name "builtUtc" -Value ""
     }
 
     Set-ObjectProperty `
@@ -1111,16 +1249,18 @@ function Get-UpdatedMetadataContent
         -Name "notes" `
         -Value "Build information will be completed after the content commit."
 
-    return @{
-        "release.json" =
-            ConvertTo-ProjectJson -InputObject $ProjectContext.Release
-
-        "package.json" =
-            ConvertTo-ProjectJson -InputObject $ProjectContext.Package
-
-        "build-info.json" =
-            ConvertTo-ProjectJson -InputObject $ProjectContext.BuildInfo
+    $UpdatedFiles = @{
+        "release.json" = ConvertTo-ProjectJson -InputObject $ProjectContext.Release
+        "build-info.json" = ConvertTo-ProjectJson -InputObject $ProjectContext.BuildInfo
     }
+
+    if ($ProjectContext.HasPackageJson -and $null -ne $ProjectContext.Package)
+    {
+        $UpdatedFiles["package.json"] =
+            ConvertTo-ProjectJson -InputObject $ProjectContext.Package
+    }
+
+    return $UpdatedFiles
 }
 
 function Set-ServiceWorkerVersion
@@ -1276,9 +1416,7 @@ function Get-UpdatedReadmeContent
         [PSCustomObject]$ProjectContext
     )
 
-    $ReadmePath = Join-Path `
-        -Path $ProjectContext.ProjectFolder `
-        -ChildPath "README.md"
+    $ReadmePath = Join-Path $ProjectContext.ProjectFolder "README.md"
 
     try
     {
@@ -1297,12 +1435,41 @@ function Get-UpdatedReadmeContent
     {
         Write-Status -Status Warning -Message "README release history markers not found."
         Write-Status -Status Warning -Message "README was left unchanged."
-
         return $Readme.TrimEnd() + [Environment]::NewLine
     }
 
-    $HistoryRows = @()
-    $HistoryRows += "| $($ProjectContext.TargetTag) | $($ProjectContext.ReleaseType) | Generated for updater regression testing. |"
+    $ExistingBlock = [regex]::Match(
+        $Readme,
+        "(?s)<!-- PROJECTCREATERELEASE:BEGIN -->.*?<!-- PROJECTCREATERELEASE:END -->"
+    ).Value
+
+    $ExistingRows = @(
+        $ExistingBlock -split '\r?\n' |
+        Where-Object { $_ -match '^\|\s*v\d+\.\d+\.\d+\s*\|' }
+    )
+
+    $Note =
+        if ([string]::IsNullOrWhiteSpace($ProjectContext.ReleaseHistoryNote))
+        {
+            "Release created."
+        }
+        else
+        {
+            $ProjectContext.ReleaseHistoryNote
+        }
+
+    $NewRow = "| $($ProjectContext.TargetTag) | $($ProjectContext.ReleaseType) | $Note |"
+    $Rows = @($NewRow)
+
+    foreach ($Row in $ExistingRows)
+    {
+        if ($Row -notmatch "^\|\s*$([regex]::Escape($ProjectContext.TargetTag))\s*\|")
+        {
+            $Rows += $Row
+        }
+    }
+
+    $Rows = @($Rows | Select-Object -First $MaximumHistoryEntries)
 
     $Replacement = @(
         $BeginMarker
@@ -1311,7 +1478,7 @@ function Get-UpdatedReadmeContent
         ""
         "| Version | Type | Notes |"
         "|---------|------|-------|"
-        $HistoryRows
+        $Rows
         ""
         $EndMarker
     ) -join [Environment]::NewLine
@@ -1790,6 +1957,12 @@ function Set-ReleaseFiles
         return
     }
 
+    if ($ProjectContext.DryRun -and $ProjectContext.IsNewProject)
+    {
+        Write-Status -Status Warning -Message "Dry run: initial release files were not changed."
+        return
+    }
+
     $UpdatedFiles =
         Get-UpdatedMetadataContent `
             -ProjectContext $ProjectContext
@@ -1807,6 +1980,11 @@ function Set-ReleaseFiles
         foreach ($FileName in $ProjectFileOrder)
         {
             Write-Host "       Would update: $FileName"
+        }
+
+        if ($ProjectContext.HasPackageJson)
+        {
+            Write-Host "       Would update: package.json"
         }
 
         $ServiceWorkerPath = Join-Path `
@@ -1836,10 +2014,15 @@ function Set-ReleaseFiles
 
     foreach ($FileName in @(
         "release.json"
-        "package.json"
         "build-info.json"
+        "package.json"
     ))
     {
+        if (-not $UpdatedFiles.ContainsKey($FileName))
+        {
+            continue
+        }
+
         $FilePath = Join-Path `
             -Path $ProjectContext.ProjectFolder `
             -ChildPath $FileName
