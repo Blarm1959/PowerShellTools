@@ -2105,39 +2105,42 @@ function Publish-ProjectRelease
         $ProjectContext.ContentCommit =
             Get-GitHead
 
-        Set-FinalBuildInfo `
-            -ProjectContext $ProjectContext
-
-        Invoke-NativeCommand `
-            -Command "git.exe" `
-            -Arguments @(
-                "add"
-                "--"
-                "build-info.json"
-            )
-
-        $BuildInfoChanges = @(
-            git.exe status --porcelain -- build-info.json
-        )
-
-        if ($LASTEXITCODE -ne 0)
+        if (-not $ProjectContext.NoBump)
         {
-            throw "Unable to check build-info.json status."
-        }
+            Set-FinalBuildInfo `
+                -ProjectContext $ProjectContext
 
-        if ($BuildInfoChanges.Count -gt 0)
-        {
             Invoke-NativeCommand `
                 -Command "git.exe" `
                 -Arguments @(
-                    "commit"
-                    "-m"
-                    "Record build metadata for $($ProjectContext.TargetTag)"
+                    "add"
+                    "--"
+                    "build-info.json"
                 )
 
-            Write-Status `
-                -Status Success `
-                -Message "Build information recorded"
+            $BuildInfoChanges = @(
+                git.exe status --porcelain -- build-info.json
+            )
+
+            if ($LASTEXITCODE -ne 0)
+            {
+                throw "Unable to check build-info.json status."
+            }
+
+            if ($BuildInfoChanges.Count -gt 0)
+            {
+                Invoke-NativeCommand `
+                    -Command "git.exe" `
+                    -Arguments @(
+                        "commit"
+                        "-m"
+                        "Record build metadata for $($ProjectContext.TargetTag)"
+                    )
+
+                Write-Status `
+                    -Status Success `
+                    -Message "Build metadata recorded"
+            }
         }
 
         $ProjectContext.FinalCommit =
@@ -2151,24 +2154,27 @@ function Publish-ProjectRelease
             -Status Success `
             -Message "Changes pushed"
 
-        Invoke-NativeCommand `
-            -Command "git.exe" `
-            -Arguments @(
-                "tag"
-                $ProjectContext.TargetTag
-            )
+        if (-not $ProjectContext.NoBump)
+        {
+            Invoke-NativeCommand `
+                -Command "git.exe" `
+                -Arguments @(
+                    "tag"
+                    $ProjectContext.TargetTag
+                )
 
-        Invoke-NativeCommand `
-            -Command "git.exe" `
-            -Arguments @(
-                "push"
-                "origin"
-                $ProjectContext.TargetTag
-            )
+            Invoke-NativeCommand `
+                -Command "git.exe" `
+                -Arguments @(
+                    "push"
+                    "origin"
+                    $ProjectContext.TargetTag
+                )
 
-        Write-Status `
-            -Status Success `
-            -Message "Tag created and pushed: $($ProjectContext.TargetTag)"
+            Write-Status `
+                -Status Success `
+                -Message "Tag created and pushed: $($ProjectContext.TargetTag)"
+        }
 
         $FinalStatus = @(Get-GitStatus)
 
