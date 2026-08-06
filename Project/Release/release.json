@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "project": "Release",
-  "version": "2.4.2",
-  "githubSource": "v2.4.2",
+  "version": "2.5.0",
+  "githubSource": "v2.5.0",
   "zipPrefix": "Release-",
   "port": 0,
   "packageChanges": false,
