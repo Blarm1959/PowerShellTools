@@ -1,44 +1,15 @@
 <#
 .SYNOPSIS
-    Project Release Creator
+    Project Release Creator shortcut.
 
 .DESCRIPTION
-    Thin project wrapper around the generic ProjectCreateRelease.ps1 tool.
+    Transparently forwards every supplied argument to the generic
+    ProjectCreateRelease.ps1 tool and supplies only the current project folder.
 
-    Exactly one change source must be selected:
-
-      -Local
-          Release changes already present in this working folder.
-
-      -Zip
-          Import the newest <Project>-Changes*.zip Change Package from
-          Windows Downloads, then release the imported changes.
-
-      -Dummy
-          Create a version-only release from a clean working tree.
-
-.NOTES
-    All release creation and Git publication logic resides in the generic tool.
-    This file should remain intentionally small.
+    The wrapper deliberately has no param() block. This means new parameters
+    added to ProjectCreateRelease.ps1 are automatically supported without
+    requiring this file to be changed.
 #>
-
-[CmdletBinding(SupportsShouldProcess = $false)]
-param
-(
-    [switch]$Local,
-
-    [switch]$Zip,
-
-    [switch]$Dummy,
-
-    [switch]$Minor,
-
-    [switch]$Major,
-
-    [string]$Version,
-
-    [switch]$DryRun
-)
 
 $ToolPath = Join-Path `
     -Path $PSScriptRoot `
@@ -55,12 +26,6 @@ if (-not (Test-Path -LiteralPath $ToolPath -PathType Leaf))
 
 & $ToolPath `
     -ProjectFolder $PSScriptRoot `
-    -Local:$Local `
-    -Zip:$Zip `
-    -Dummy:$Dummy `
-    -Minor:$Minor `
-    -Major:$Major `
-    -Version $Version `
-    -DryRun:$DryRun
+    @args
 
 exit $LASTEXITCODE
