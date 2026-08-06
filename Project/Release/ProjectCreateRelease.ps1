@@ -54,6 +54,8 @@ param
     [switch]$Zip,
 
     [switch]$Dummy,
+    [switch]$NoBump,
+    [string]$Message,
 
     [switch]$Minor,
 
@@ -63,6 +65,10 @@ param
 
     [switch]$DryRun
 )
+
+if ($Dummy -and $NoBump) {
+    throw "-NoBump cannot be combined with -Dummy."
+}
 
 #region Configuration
 
@@ -2300,3 +2306,5 @@ catch
 }
 
 #endregion Main
+
+# NOTE: v2.3.0 placeholder: -NoBump support scaffold added. Full behavioral integration (skip version bump/tag/build metadata, use Update commit message) to be implemented throughout release pipeline.
