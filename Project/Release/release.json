@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "project": "Release",
+  "version": "2.4.2",
+  "githubSource": "v2.4.2",
+  "zipPrefix": "Release-",
+  "port": 0,
+  "packageChanges": false,
+  "commit": "Release Release v2.4.2",
+  "i18n": {
+    "enabled": false,
+    "folder": "src/i18n",
+    "masterLanguage": "en-GB",
+    "defaultLanguage": "en-GB",
+    "languages": [
+      "en-GB"
+    ]
+  }
+}

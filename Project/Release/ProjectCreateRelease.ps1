@@ -37,6 +37,8 @@
 #>
 
 # Version History
+# 2.4.2 - Added complete README creation and managed release-history initialisation.
+# 2.4.1 - Improved new-project detection, metadata messages and initial summary output.
 # 2.4.0 - Added project bootstrap metadata and simplified explicit versioning.
 # 2.3.0 - Added complete -NoBump development commit support.
 # 2.0.0 - Unified -Local, -Zip and -Dummy release sources; Git commit/tag/push.
@@ -67,7 +69,7 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.4.0"
+$ScriptVersion = "2.4.2"
 $InitialVersion      = "0.0.1"
 $InitialReleaseType  = "Initial"
 $InitialReleaseNotes = "Initial project created."
@@ -119,6 +121,7 @@ $ProjectContext = [PSCustomObject]@{
     DryRun              = [bool]$DryRun
     HasPackageJson      = $false
     IsNewProject        = $false
+    ReadmeWasMissing    = $false
     InitialVersion      = $InitialVersion
 }
 
@@ -509,6 +512,31 @@ function New-InitialBuildInfoJson
     }
 }
 
+
+# -------------------------------------------------------------------------
+# v2.4.2 README behaviour
+#
+# README handling rules:
+#
+# 1. If README.md does not exist:
+#    - Create it.
+#    - Include "## Current Release".
+#    - Include RELEASE-HISTORY-START / END markers.
+#    - Insert the current release row.
+#
+# 2. If this is an Initial release and README.md already exists:
+#    - Append the Current Release section and release-history block to the end
+#      of the README regardless of whether markers currently exist.
+#
+# 3. Existing (non-initial) releases:
+#    - If markers exist, update Current Release and insert the new history row.
+#    - If markers do not exist, leave the README unchanged and issue the
+#      existing warning.
+#
+# This ensures every new project starts with managed version history while
+# respecting deliberate marker removal on existing projects.
+# -------------------------------------------------------------------------
+
 function New-InitialReadmeContent
 {
     [CmdletBinding()]
@@ -527,19 +555,8 @@ function New-InitialReadmeContent
         ""
         "Project documentation."
         ""
-        "<!-- PROJECTCREATERELEASE:BEGIN -->"
-        ""
-        "## Release History"
-        ""
-        "| Version | Type | Notes |"
-        "|---------|------|-------|"
-        "| v$($ProjectContext.InitialVersion) | $InitialReleaseType | $InitialReleaseNotes |"
-        ""
-        "<!-- PROJECTCREATERELEASE:END -->"
-        ""
     ) -join [Environment]::NewLine
 }
-
 function Initialize-ProjectMetadataFiles
 {
     [CmdletBinding()]
@@ -557,10 +574,26 @@ function Initialize-ProjectMetadataFiles
         Test-Path -LiteralPath $ReleasePath -PathType Leaf
     )
 
+    $ProjectContext.ReadmeWasMissing = -not (
+        Test-Path -LiteralPath $ReadmePath -PathType Leaf
+    )
+
     $Missing = @()
-    if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf)) { $Missing += "release.json" }
-    if (-not (Test-Path -LiteralPath $BuildInfoPath -PathType Leaf)) { $Missing += "build-info.json" }
-    if (-not (Test-Path -LiteralPath $ReadmePath -PathType Leaf)) { $Missing += "README.md" }
+
+    if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf))
+    {
+        $Missing += "release.json"
+    }
+
+    if (-not (Test-Path -LiteralPath $BuildInfoPath -PathType Leaf))
+    {
+        $Missing += "build-info.json"
+    }
+
+    if ($ProjectContext.ReadmeWasMissing)
+    {
+        $Missing += "README.md"
+    }
 
     if ($Missing.Count -eq 0)
     {
@@ -573,7 +606,8 @@ function Initialize-ProjectMetadataFiles
             "A new project must be initialised with a versioned release. Remove -NoBump."
     }
 
-    if ($ProjectContext.SourceMode -eq "Dummy" -and $ProjectContext.IsNewProject)
+    if ($ProjectContext.SourceMode -eq "Dummy" -and
+        $ProjectContext.IsNewProject)
     {
         Stop-ProjectRelease `
             "A new project must be initialised from Local changes, not -Dummy."
@@ -581,12 +615,19 @@ function Initialize-ProjectMetadataFiles
 
     if ($ProjectContext.IsNewProject)
     {
-        Write-Status -Status Success -Message "New project detected"
-        Write-Status -Status Progress -Message "Creating project metadata"
+        Write-Status `
+            -Status Success `
+            -Message "New project detected"
+
+        Write-Status `
+            -Status Progress `
+            -Message "Creating project metadata"
     }
     else
     {
-        Write-Status -Status Progress -Message "Creating missing project metadata"
+        Write-Status `
+            -Status Progress `
+            -Message "Creating missing project metadata"
     }
 
     if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf))
@@ -602,11 +643,15 @@ function Initialize-ProjectMetadataFiles
                 -Content (
                     ConvertTo-ProjectJson `
                         -InputObject (
-                            New-InitialReleaseJson -ProjectContext $ProjectContext
+                            New-InitialReleaseJson `
+                                -ProjectContext $ProjectContext
                         )
                 )
         }
-        Write-Status -Status Success -Message "Created: release.json"
+
+        Write-Status `
+            -Status Success `
+            -Message "Created: release.json"
     }
 
     if (-not (Test-Path -LiteralPath $BuildInfoPath -PathType Leaf))
@@ -622,14 +667,18 @@ function Initialize-ProjectMetadataFiles
                 -Content (
                     ConvertTo-ProjectJson `
                         -InputObject (
-                            New-InitialBuildInfoJson -ProjectContext $ProjectContext
+                            New-InitialBuildInfoJson `
+                                -ProjectContext $ProjectContext
                         )
                 )
         }
-        Write-Status -Status Success -Message "Created: build-info.json"
+
+        Write-Status `
+            -Status Success `
+            -Message "Created: build-info.json"
     }
 
-    if (-not (Test-Path -LiteralPath $ReadmePath -PathType Leaf))
+    if ($ProjectContext.ReadmeWasMissing)
     {
         if ($ProjectContext.DryRun)
         {
@@ -640,18 +689,23 @@ function Initialize-ProjectMetadataFiles
             Write-TextFileUtf8NoBom `
                 -Path $ReadmePath `
                 -Content (
-                    New-InitialReadmeContent -ProjectContext $ProjectContext
+                    New-InitialReadmeContent `
+                        -ProjectContext $ProjectContext
                 )
         }
-        Write-Status -Status Success -Message "Created: README.md"
+
+        Write-Status `
+            -Status Success `
+            -Message "Created: README.md"
     }
 
     if ($ProjectContext.DryRun -and $ProjectContext.IsNewProject)
     {
-        Write-Status -Status Warning -Message "Dry run: initial metadata files were not created."
+        Write-Status `
+            -Status Warning `
+            -Message "Dry run: initial metadata files were not created."
     }
 }
-
 function Test-ProjectFiles
 {
     [CmdletBinding()]
@@ -1424,11 +1478,16 @@ function Get-UpdatedReadmeContent
         [PSCustomObject]$ProjectContext
     )
 
-    $ReadmePath = Join-Path $ProjectContext.ProjectFolder "README.md"
+    $ReadmePath = Join-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -ChildPath "README.md"
 
     try
     {
-        $Readme = Get-Content -LiteralPath $ReadmePath -Raw -ErrorAction Stop
+        $Readme = Get-Content `
+            -LiteralPath $ReadmePath `
+            -Raw `
+            -ErrorAction Stop
     }
     catch
     {
@@ -1436,35 +1495,63 @@ function Get-UpdatedReadmeContent
     }
 
     $BeginMarker = "<!-- PROJECTCREATERELEASE:BEGIN -->"
-    $EndMarker   = "<!-- PROJECTCREATERELEASE:END -->"
+    $EndMarker = "<!-- PROJECTCREATERELEASE:END -->"
 
-    if (($Readme.IndexOf($BeginMarker) -lt 0) -or
-        ($Readme.IndexOf($EndMarker) -lt 0))
+    $HasBeginMarker = $Readme.IndexOf($BeginMarker) -ge 0
+    $HasEndMarker = $Readme.IndexOf($EndMarker) -ge 0
+
+    if ($HasBeginMarker -xor $HasEndMarker)
     {
-        if ($ProjectContext.IsNewProject)
-        {
-            Write-Status -Status Success -Message "README initialised with release history."
-        }
-        else
-        {
-            Write-Status -Status Warning -Message "README release history markers not found."
-            Write-Status -Status Warning -Message "README was left unchanged."
-        }
+        Write-Status `
+            -Status Warning `
+            -Message "README contains only one release history marker."
+
+        Write-Status `
+            -Status Warning `
+            -Message "README was left unchanged."
+
         return $Readme.TrimEnd() + [Environment]::NewLine
     }
 
-    $ExistingBlock = [regex]::Match(
-        $Readme,
-        "(?s)<!-- PROJECTCREATERELEASE:BEGIN -->.*?<!-- PROJECTCREATERELEASE:END -->"
-    ).Value
+    $HasMarkers = $HasBeginMarker -and $HasEndMarker
+    $ShouldInitialiseHistory =
+        $ProjectContext.IsNewProject -or
+        $ProjectContext.ReadmeWasMissing
 
-    $ExistingRows = @(
-        $ExistingBlock -split '\r?\n' |
-        Where-Object { $_ -match '^\|\s*v\d+\.\d+\.\d+\s*\|' }
-    )
+    if (-not $HasMarkers -and -not $ShouldInitialiseHistory)
+    {
+        Write-Status `
+            -Status Warning `
+            -Message "README release history markers not found."
+
+        Write-Status `
+            -Status Warning `
+            -Message "README was left unchanged."
+
+        return $Readme.TrimEnd() + [Environment]::NewLine
+    }
+
+    $ExistingRows = @()
+
+    if ($HasMarkers)
+    {
+        $ExistingBlock = [regex]::Match(
+            $Readme,
+            "(?s)<!-- PROJECTCREATERELEASE:BEGIN -->.*?<!-- PROJECTCREATERELEASE:END -->"
+        ).Value
+
+        $ExistingRows = @(
+            $ExistingBlock -split '\r?\n' |
+            Where-Object {
+                $_ -match '^\|\s*v\d+\.\d+\.\d+\s*\|'
+            }
+        )
+    }
 
     $Note =
-        if ([string]::IsNullOrWhiteSpace($ProjectContext.ReleaseHistoryNote))
+        if ([string]::IsNullOrWhiteSpace(
+            $ProjectContext.ReleaseHistoryNote
+        ))
         {
             "Release created."
         }
@@ -1473,18 +1560,25 @@ function Get-UpdatedReadmeContent
             $ProjectContext.ReleaseHistoryNote
         }
 
-    $NewRow = "| $($ProjectContext.TargetTag) | $($ProjectContext.ReleaseType) | $Note |"
+    $NewRow =
+        "| $($ProjectContext.TargetTag) | $($ProjectContext.ReleaseType) | $Note |"
+
     $Rows = @($NewRow)
 
     foreach ($Row in $ExistingRows)
     {
-        if ($Row -notmatch "^\|\s*$([regex]::Escape($ProjectContext.TargetTag))\s*\|")
+        if ($Row -notmatch "^\|\s*$([regex]::Escape(
+            $ProjectContext.TargetTag
+        ))\s*\|")
         {
             $Rows += $Row
         }
     }
 
-    $Rows = @($Rows | Select-Object -First $MaximumHistoryEntries)
+    $Rows = @(
+        $Rows |
+        Select-Object -First $MaximumHistoryEntries
+    )
 
     $Replacement = @(
         $BeginMarker
@@ -1498,13 +1592,37 @@ function Get-UpdatedReadmeContent
         $EndMarker
     ) -join [Environment]::NewLine
 
-    $Pattern = "(?s)<!-- PROJECTCREATERELEASE:BEGIN -->.*?<!-- PROJECTCREATERELEASE:END -->"
+    if ($HasMarkers)
+    {
+        $Pattern =
+            "(?s)<!-- PROJECTCREATERELEASE:BEGIN -->.*?<!-- PROJECTCREATERELEASE:END -->"
 
-    $Readme = [regex]::Replace(
-        $Readme,
-        $Pattern,
-        [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $Replacement }
-    )
+        $Readme = [regex]::Replace(
+            $Readme,
+            $Pattern,
+            [System.Text.RegularExpressions.MatchEvaluator]{
+                param($Match)
+                $Replacement
+            }
+        )
+
+        Write-Status `
+            -Status Success `
+            -Message "README release history updated."
+    }
+    else
+    {
+        $Readme =
+            $Readme.TrimEnd() +
+            [Environment]::NewLine +
+            [Environment]::NewLine +
+            $Replacement +
+            [Environment]::NewLine
+
+        Write-Status `
+            -Status Success `
+            -Message "README release history initialised."
+    }
 
     return $Readme.TrimEnd() + [Environment]::NewLine
 }
@@ -1974,7 +2092,11 @@ function Set-ReleaseFiles
 
     if ($ProjectContext.DryRun -and $ProjectContext.IsNewProject)
     {
-        Write-Status -Status Warning -Message "Dry run: initial release files were not changed."
+        Write-Status `
+            -Status Warning `
+            -Message "Dry run: initial release files were not changed."
+
+        Write-Host "       Would initialise README release history."
         return
     }
 
