@@ -11,16 +11,30 @@
     requiring this file to be changed.
 #>
 
-$ToolPath = Join-Path `
-    -Path $PSScriptRoot `
-    -ChildPath "..\PowerShellTools\Project\Release\ProjectCreateRelease.ps1"
+$SearchFolder = Get-Item -LiteralPath $PSScriptRoot
+$ToolPath = $null
 
-if (-not (Test-Path -LiteralPath $ToolPath -PathType Leaf))
+while ($SearchFolder -ne $null)
+{
+    $Candidate = Join-Path `
+        -Path $SearchFolder.FullName `
+        -ChildPath "PowerShellTools\Project\Release\ProjectCreateRelease.ps1"
+
+    if (Test-Path -LiteralPath $Candidate -PathType Leaf)
+    {
+        $ToolPath = $Candidate
+        break
+    }
+
+    $SearchFolder = $SearchFolder.Parent
+}
+
+if (-not $ToolPath)
 {
     Write-Host ""
     Write-Host "[FAIL] ProjectCreateRelease.ps1 not found." -ForegroundColor Red
-    Write-Host "       Expected:"
-    Write-Host "       $ToolPath"
+    Write-Host "       Searched upwards from:"
+    Write-Host "       $PSScriptRoot"
     exit 1
 }
 
