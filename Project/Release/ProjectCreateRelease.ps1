@@ -37,6 +37,7 @@
 #>
 
 # Version History
+# 2.3.0 - Added complete -NoBump development commit support.
 # 2.0.0 - Unified -Local, -Zip and -Dummy release sources; Git commit/tag/push.
 # 1.3.0 - Complete-project ZIP creation and verification.
 # 1.2.2 - Reliable two-space JSON formatter.
@@ -66,14 +67,11 @@ param
     [switch]$DryRun
 )
 
-if ($Dummy -and $NoBump) {
-    throw "-NoBump cannot be combined with -Dummy."
-}
 
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.1.0"
+$ScriptVersion = "2.3.0"
 $MaximumHistoryEntries = 25
 
 $ReleaseManagedZipFiles = @(
@@ -116,6 +114,8 @@ $ProjectContext = [PSCustomObject]@{
     ContentCommit       = $null
     FinalCommit         = $null
     BuiltUtc            = $null
+    NoBump              = [bool]$NoBump
+    Message             = $Message
     DryRun              = [bool]$DryRun
     HasPackageJson      = $false
 }
@@ -186,11 +186,25 @@ function Stop-ProjectRelease
 function Show-Banner
 {
     [CmdletBinding()]
-    param()
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    $Title =
+        if ($ProjectContext.NoBump)
+        {
+            "Blarm Generic Project Development Commit"
+        }
+        else
+        {
+            "Blarm Generic Project Release Creator"
+        }
 
     Write-Host ""
     Write-Host "========================================================="
-    Write-Host " Blarm Generic Project Release Creator"
+    Write-Host " $Title"
     Write-Host " Version $ScriptVersion"
     Write-Host "========================================================="
     Write-Host ""
@@ -399,52 +413,16 @@ function Test-CommandLine
     )
 
     $SourceCount = 0
+    if ($Local) { $SourceCount++ }
+    if ($Zip)   { $SourceCount++ }
+    if ($Dummy) { $SourceCount++ }
 
-    if ($Local)
+    if ($SourceCount -gt 1)
     {
-        $SourceCount++
+        Stop-ProjectRelease "Use only one change source: -Local, -Zip or -Dummy."
     }
 
-    if ($Zip)
-    {
-        $SourceCount++
-    }
-
-    if ($Dummy)
-    {
-        $SourceCount++
-    }
-
-    if ($SourceCount -ne 1)
-    {
-        Stop-ProjectRelease `
-            "Specify exactly one change source: -Local, -Zip or -Dummy."
-    }
-
-    $VersionChoiceCount = 0
-
-    if ($Minor)
-    {
-        $VersionChoiceCount++
-    }
-
-    if ($Major)
-    {
-        $VersionChoiceCount++
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($Version))
-    {
-        $VersionChoiceCount++
-    }
-
-    if ($VersionChoiceCount -gt 1)
-    {
-        Stop-ProjectRelease `
-            "Use only one of -Minor, -Major or -Version."
-    }
-
-    if ($Local)
+    if ($SourceCount -eq 0 -or $Local)
     {
         $ProjectContext.SourceMode = "Local"
     }
@@ -455,6 +433,36 @@ function Test-CommandLine
     else
     {
         $ProjectContext.SourceMode = "Dummy"
+    }
+
+    if ($ProjectContext.NoBump -and $ProjectContext.SourceMode -eq "Dummy")
+    {
+        Stop-ProjectRelease @"
+-NoBump cannot be combined with -Dummy.
+
+-Dummy always creates a new version, tag and build metadata.
+"@
+    }
+
+    $VersionChoiceCount = 0
+    if ($Minor) { $VersionChoiceCount++ }
+    if ($Major) { $VersionChoiceCount++ }
+    if (-not [string]::IsNullOrWhiteSpace($Version)) { $VersionChoiceCount++ }
+
+    if ($VersionChoiceCount -gt 1)
+    {
+        Stop-ProjectRelease "Use only one of -Minor, -Major or -Version."
+    }
+
+    if ($ProjectContext.NoBump -and $VersionChoiceCount -gt 0)
+    {
+        Stop-ProjectRelease "-NoBump cannot be combined with -Minor, -Major or -Version."
+    }
+
+    if (-not $ProjectContext.NoBump -and
+        -not [string]::IsNullOrWhiteSpace($ProjectContext.Message))
+    {
+        Stop-ProjectRelease "-Message can only be used with -NoBump."
     }
 }
 
@@ -922,6 +930,28 @@ function Get-TargetVersion
         [Parameter(Mandatory = $true)]
         [PSCustomObject]$ProjectContext
     )
+
+    if ($ProjectContext.NoBump)
+    {
+        Write-Status -Status Progress -Message "Preparing development commit"
+
+        $ProjectContext.TargetVersion = $ProjectContext.CurrentVersion
+        $ProjectContext.TargetTag = $null
+        $ProjectContext.ReleaseType = "NoBump"
+        $ProjectContext.ReleaseHistoryNote = $null
+        $ProjectContext.CommitMessage =
+            if ([string]::IsNullOrWhiteSpace($ProjectContext.Message))
+            {
+                "Update $($ProjectContext.ProjectName)"
+            }
+            else
+            {
+                $ProjectContext.Message.Trim()
+            }
+
+        Write-Status -Status Success -Message "Version unchanged: $($ProjectContext.CurrentVersion)"
+        return
+    }
 
     Write-Status `
         -Status Progress `
@@ -1754,6 +1784,12 @@ function Set-ReleaseFiles
         [PSCustomObject]$ProjectContext
     )
 
+    if ($ProjectContext.NoBump)
+    {
+        Write-Status -Status Success -Message "Release metadata unchanged (-NoBump)"
+        return
+    }
+
     $UpdatedFiles =
         Get-UpdatedMetadataContent `
             -ProjectContext $ProjectContext
@@ -1880,46 +1916,39 @@ function Invoke-PackageInstall
         [PSCustomObject]$ProjectContext
     )
 
-    if (-not $ProjectContext.HasPackageJson)
-    {
-        return
-    }
+    if (-not $ProjectContext.HasPackageJson) { return }
 
     if ($ProjectContext.DryRun)
     {
-        Write-Host "       Would validate: release metadata"
+        if (-not $ProjectContext.NoBump)
+        {
+            Write-Host "       Would validate: release metadata"
+        }
         Write-Host "       Would run: npm install"
         return
     }
 
-    Write-Status `
-        -Status Progress `
-        -Message "Running npm install"
-
+    Write-Status -Status Progress -Message "Running npm install"
     try
     {
         Push-Location $ProjectContext.ProjectFolder
-
-        Invoke-NativeCommand `
-            -Command "npm.cmd" `
-            -Arguments @("install")
+        Invoke-NativeCommand -Command "npm.cmd" -Arguments @("install")
     }
     catch
     {
-        Stop-ProjectRelease `
-            "npm install failed: $($_.Exception.Message)"
+        Stop-ProjectRelease "npm install failed: $($_.Exception.Message)"
     }
     finally
     {
         Pop-Location
     }
 
-    Assert-ReleaseMetadata `
-        -ProjectContext $ProjectContext
+    if (-not $ProjectContext.NoBump)
+    {
+        Assert-ReleaseMetadata -ProjectContext $ProjectContext
+    }
 
-    Write-Status `
-        -Status Success `
-        -Message "npm install completed"
+    Write-Status -Status Success -Message "npm install completed"
 }
 
 #endregion Package Handling
@@ -2040,13 +2069,19 @@ function Publish-ProjectRelease
 
     if ($ProjectContext.DryRun)
     {
-        Write-Status `
-            -Status Warning `
-            -Message "Dry run: Git commit, push and tag were not performed."
-
-        Write-Host "       Would commit: $($ProjectContext.CommitMessage)"
-        Write-Host "       Would tag: $($ProjectContext.TargetTag)"
-        Write-Host "       Would push commits and tag"
+        if ($ProjectContext.NoBump)
+        {
+            Write-Status -Status Warning -Message "Dry run: Git commit and push were not performed."
+            Write-Host "       Would commit: $($ProjectContext.CommitMessage)"
+            Write-Host "       Would push commit"
+        }
+        else
+        {
+            Write-Status -Status Warning -Message "Dry run: Git commit, push and tag were not performed."
+            Write-Host "       Would commit: $($ProjectContext.CommitMessage)"
+            Write-Host "       Would tag: $($ProjectContext.TargetTag)"
+            Write-Host "       Would push commits and tag"
+        }
         return
     }
 
@@ -2054,130 +2089,70 @@ function Publish-ProjectRelease
     {
         Push-Location $ProjectContext.ProjectFolder
 
-        Write-Status `
-            -Status Progress `
-            -Message "Preparing Git release"
+        $PreparationMessage =
+            if ($ProjectContext.NoBump) { "Preparing Git development commit" }
+            else { "Preparing Git release" }
 
-        $GitIgnorePath = Join-Path `
-            -Path $ProjectContext.ProjectFolder `
-            -ChildPath ".gitignore"
+        Write-Status -Status Progress -Message $PreparationMessage
 
-        Ensure-GitIgnoreEntry `
-            -GitIgnorePath $GitIgnorePath `
-            -Entry ".vs/"
+        $GitIgnorePath = Join-Path -Path $ProjectContext.ProjectFolder -ChildPath ".gitignore"
+        Ensure-GitIgnoreEntry -GitIgnorePath $GitIgnorePath -Entry ".vs/"
 
-        Invoke-NativeCommand `
-            -Command "git.exe" `
-            -Arguments @(
-                "rm"
-                "-r"
-                "--cached"
-                "--ignore-unmatch"
-                ".vs"
-            )
-
-        Assert-ReleaseMetadata `
-            -ProjectContext $ProjectContext
-
-        Invoke-NativeCommand `
-            -Command "git.exe" `
-            -Arguments @("add", "--all")
-
-        $PendingChanges = @(Get-GitStatus)
-
-        if ($PendingChanges.Count -eq 0)
-        {
-            throw "No Git changes remain to commit."
-        }
-
-        Invoke-NativeCommand `
-            -Command "git.exe" `
-            -Arguments @(
-                "commit"
-                "-m"
-                $ProjectContext.CommitMessage
-            )
-
-        Write-Status `
-            -Status Success `
-            -Message "Project changes committed"
-
-        $ProjectContext.ContentCommit =
-            Get-GitHead
+        Invoke-NativeCommand -Command "git.exe" -Arguments @(
+            "rm", "-r", "--cached", "--ignore-unmatch", ".vs"
+        )
 
         if (-not $ProjectContext.NoBump)
         {
-            Set-FinalBuildInfo `
-                -ProjectContext $ProjectContext
+            Assert-ReleaseMetadata -ProjectContext $ProjectContext
+        }
 
-            Invoke-NativeCommand `
-                -Command "git.exe" `
-                -Arguments @(
-                    "add"
-                    "--"
-                    "build-info.json"
-                )
+        Invoke-NativeCommand -Command "git.exe" -Arguments @("add", "--all")
+        $PendingChanges = @(Get-GitStatus)
+        if ($PendingChanges.Count -eq 0) { throw "No Git changes remain to commit." }
 
-            $BuildInfoChanges = @(
-                git.exe status --porcelain -- build-info.json
-            )
+        Invoke-NativeCommand -Command "git.exe" -Arguments @(
+            "commit", "-m", $ProjectContext.CommitMessage
+        )
 
-            if ($LASTEXITCODE -ne 0)
-            {
-                throw "Unable to check build-info.json status."
-            }
+        $CommitStatus =
+            if ($ProjectContext.NoBump) { "Development changes committed" }
+            else { "Project changes committed" }
+        Write-Status -Status Success -Message $CommitStatus
+
+        $ProjectContext.ContentCommit = Get-GitHead
+
+        # NoBump deliberately skips build-info.json and the second commit.
+        if (-not $ProjectContext.NoBump)
+        {
+            Set-FinalBuildInfo -ProjectContext $ProjectContext
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("add", "--", "build-info.json")
+
+            $BuildInfoChanges = @(git.exe status --porcelain -- build-info.json)
+            if ($LASTEXITCODE -ne 0) { throw "Unable to check build-info.json status." }
 
             if ($BuildInfoChanges.Count -gt 0)
             {
-                Invoke-NativeCommand `
-                    -Command "git.exe" `
-                    -Arguments @(
-                        "commit"
-                        "-m"
-                        "Record build metadata for $($ProjectContext.TargetTag)"
-                    )
-
-                Write-Status `
-                    -Status Success `
-                    -Message "Build metadata recorded"
+                Invoke-NativeCommand -Command "git.exe" -Arguments @(
+                    "commit", "-m", "Record build metadata for $($ProjectContext.TargetTag)"
+                )
+                Write-Status -Status Success -Message "Build metadata recorded"
             }
         }
 
-        $ProjectContext.FinalCommit =
-            Get-GitHead
+        $ProjectContext.FinalCommit = Get-GitHead
+        Invoke-NativeCommand -Command "git.exe" -Arguments @("push")
+        Write-Status -Status Success -Message "Changes pushed"
 
-        Invoke-NativeCommand `
-            -Command "git.exe" `
-            -Arguments @("push")
-
-        Write-Status `
-            -Status Success `
-            -Message "Changes pushed"
-
+        # NoBump deliberately creates no tag.
         if (-not $ProjectContext.NoBump)
         {
-            Invoke-NativeCommand `
-                -Command "git.exe" `
-                -Arguments @(
-                    "tag"
-                    $ProjectContext.TargetTag
-                )
-
-            Invoke-NativeCommand `
-                -Command "git.exe" `
-                -Arguments @(
-                    "push"
-                    "origin"
-                    $ProjectContext.TargetTag
-                )
-
-            Write-Status `
-                -Status Success `
-                -Message "Tag created and pushed: $($ProjectContext.TargetTag)"
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("tag", $ProjectContext.TargetTag)
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("push", "origin", $ProjectContext.TargetTag)
+            Write-Status -Status Success -Message "Tag created and pushed: $($ProjectContext.TargetTag)"
         }
 
         $FinalStatus = @(Get-GitStatus)
-
         if ($FinalStatus.Count -gt 0)
         {
             throw "The Git working tree is not clean after publishing."
@@ -2206,20 +2181,23 @@ function Write-ProjectSummary
         [PSCustomObject]$ProjectContext
     )
 
-    $DryRunText =
-        if ($ProjectContext.DryRun)
-        {
-            "Yes"
-        }
-        else
-        {
-            "No"
-        }
+    $DryRunText = if ($ProjectContext.DryRun) { "Yes" } else { "No" }
 
     Write-Host ""
     Write-Host "=========================================================" -ForegroundColor Green
 
-    if ($ProjectContext.DryRun)
+    if ($ProjectContext.NoBump)
+    {
+        if ($ProjectContext.DryRun)
+        {
+            Write-Host " DEVELOPMENT COMMIT DRY RUN COMPLETE" -ForegroundColor Green
+        }
+        else
+        {
+            Write-Host " DEVELOPMENT COMMIT COMPLETE" -ForegroundColor Green
+        }
+    }
+    elseif ($ProjectContext.DryRun)
     {
         Write-Host " RELEASE DRY RUN COMPLETE" -ForegroundColor Green
     }
@@ -2239,21 +2217,27 @@ function Write-ProjectSummary
     }
 
     Write-Host "Current Version : $($ProjectContext.CurrentVersion)"
-    Write-Host "Target Version  : $($ProjectContext.TargetVersion)"
-    Write-Host "Release Type    : $($ProjectContext.ReleaseType)"
-    Write-Host "Tag             : $($ProjectContext.TargetTag)"
-    Write-Host "Dry Run         : $DryRunText"
 
-    if (-not [string]::IsNullOrWhiteSpace(
-        $ProjectContext.FinalCommit
-    ))
+    if ($ProjectContext.NoBump)
     {
-        Write-Host "Commit          : $($ProjectContext.FinalCommit.Substring(
-            0,
-            [Math]::Min(12, $ProjectContext.FinalCommit.Length)
-        ))"
+        Write-Host "Version         : Unchanged"
+        Write-Host "Commit Message  : $($ProjectContext.CommitMessage)"
+    }
+    else
+    {
+        Write-Host "Target Version  : $($ProjectContext.TargetVersion)"
+        Write-Host "Release Type    : $($ProjectContext.ReleaseType)"
+        Write-Host "Tag             : $($ProjectContext.TargetTag)"
     }
 
+    Write-Host "Dry Run         : $DryRunText"
+
+    if (-not [string]::IsNullOrWhiteSpace($ProjectContext.FinalCommit))
+    {
+        Write-Host "Commit          : $($ProjectContext.FinalCommit.Substring(
+            0, [Math]::Min(12, $ProjectContext.FinalCommit.Length)
+        ))"
+    }
     Write-Host ""
 }
 
@@ -2263,7 +2247,8 @@ function Write-ProjectSummary
 
 try
 {
-    Show-Banner
+    Show-Banner `
+        -ProjectContext $ProjectContext
 
     Test-CommandLine `
         -ProjectContext $ProjectContext
@@ -2289,8 +2274,11 @@ try
     Get-TargetVersion `
         -ProjectContext $ProjectContext
 
-    Test-TargetTagAvailable `
-        -ProjectContext $ProjectContext
+    if (-not $ProjectContext.NoBump)
+    {
+        Test-TargetTagAvailable `
+            -ProjectContext $ProjectContext
+    }
 
     Set-ReleaseFiles `
         -ProjectContext $ProjectContext
@@ -2312,5 +2300,3 @@ catch
 }
 
 #endregion Main
-
-# NOTE: v2.3.0 placeholder: -NoBump support scaffold added. Full behavioral integration (skip version bump/tag/build metadata, use Update commit message) to be implemented throughout release pipeline.
