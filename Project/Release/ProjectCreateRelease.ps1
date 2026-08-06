@@ -579,7 +579,15 @@ function Initialize-ProjectMetadataFiles
             "A new project must be initialised from Local changes, not -Dummy."
     }
 
-    Write-Status -Status Progress -Message "Initialising missing project metadata"
+    if ($ProjectContext.IsNewProject)
+    {
+        Write-Status -Status Success -Message "New project detected"
+        Write-Status -Status Progress -Message "Creating project metadata"
+    }
+    else
+    {
+        Write-Status -Status Progress -Message "Creating missing project metadata"
+    }
 
     if (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf))
     {
@@ -1433,8 +1441,15 @@ function Get-UpdatedReadmeContent
     if (($Readme.IndexOf($BeginMarker) -lt 0) -or
         ($Readme.IndexOf($EndMarker) -lt 0))
     {
-        Write-Status -Status Warning -Message "README release history markers not found."
-        Write-Status -Status Warning -Message "README was left unchanged."
+        if ($ProjectContext.IsNewProject)
+        {
+            Write-Status -Status Success -Message "README initialised with release history."
+        }
+        else
+        {
+            Write-Status -Status Warning -Message "README release history markers not found."
+            Write-Status -Status Warning -Message "README was left unchanged."
+        }
         return $Readme.TrimEnd() + [Environment]::NewLine
     }
 
@@ -2399,7 +2414,14 @@ function Write-ProjectSummary
         Write-Host "Change Package  : $($ProjectContext.SourceZip.Name)"
     }
 
-    Write-Host "Current Version : $($ProjectContext.CurrentVersion)"
+    if ($ProjectContext.IsNewProject)
+    {
+        Write-Host "Current Version : (new project)"
+    }
+    else
+    {
+        Write-Host "Current Version : $($ProjectContext.CurrentVersion)"
+    }
 
     if ($ProjectContext.NoBump)
     {
