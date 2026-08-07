@@ -3,5 +3,5 @@
   "tag": "v1.0.1",
   "commit": "9206fe946c7d0823472d9d356970c3e6b99e6e9d",
   "builtUtc": "2026-08-06T18:02:46.0324471Z",
-  "notes": "Build metadata recorded by ProjectCreateRelease.ps1."
+  "notes": "Build metadata recorded by ProjectRelease.ps1."
 }

@@ -4,10 +4,10 @@
 
 .DESCRIPTION
     Transparently forwards every supplied argument to the generic
-    ProjectCreateRelease.ps1 tool and supplies only the current project folder.
+    ProjectRelease.ps1 tool and supplies only the current project folder.
 
     The wrapper deliberately has no param() block. This means new parameters
-    added to ProjectCreateRelease.ps1 are automatically supported without
+    added to ProjectRelease.ps1 are automatically supported without
     requiring this file to be changed.
 #>
 
@@ -18,7 +18,7 @@ while ($SearchFolder -ne $null)
 {
     $Candidate = Join-Path `
         -Path $SearchFolder.FullName `
-        -ChildPath "PowerShellTools\Project\Release\ProjectCreateRelease.ps1"
+        -ChildPath "PowerShellTools\Project\Release\ProjectRelease.ps1"
 
     if (Test-Path -LiteralPath $Candidate -PathType Leaf)
     {
@@ -32,7 +32,7 @@ while ($SearchFolder -ne $null)
 if (-not $ToolPath)
 {
     Write-Host ""
-    Write-Host "[FAIL] ProjectCreateRelease.ps1 not found." -ForegroundColor Red
+    Write-Host "[FAIL] ProjectRelease.ps1 not found." -ForegroundColor Red
     Write-Host "       Searched upwards from:"
     Write-Host "       $PSScriptRoot"
     exit 1

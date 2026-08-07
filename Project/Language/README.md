@@ -4,7 +4,7 @@ Generic localisation management tool.
 
 Status: Design phase.
 
-<!-- PROJECTCREATERELEASE:BEGIN -->
+<!-- PROJECTRELEASE:BEGIN -->
 
 ## Release History
 
@@ -12,4 +12,4 @@ Status: Design phase.
 |---------|------|-------|
 | v0.0.1 | Initial | Initial project created. |
 
-<!-- PROJECTCREATERELEASE:END -->
+<!-- PROJECTRELEASE:END -->
