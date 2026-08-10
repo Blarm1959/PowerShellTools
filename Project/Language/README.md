@@ -10,6 +10,7 @@ Status: Design phase.
 
 | Version | Type | Notes |
 |---------|------|-------|
+| v0.0.2 | Patch | Released from local project changes. |
 | v0.0.1 | Initial | Initial project created. |
 
 <!-- PROJECTRELEASE:END -->

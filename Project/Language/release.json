@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "project": "Language",
-  "version": "0.0.1",
-  "githubSource": "v0.0.1",
+  "version": "0.0.2",
+  "githubSource": "v0.0.2",
   "zipPrefix": "Language-",
   "port": 0,
   "packageChanges": false,
