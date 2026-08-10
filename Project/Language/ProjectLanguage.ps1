@@ -5,8 +5,8 @@
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$Languages,
 
-    [ValidateSet("Google", "OpenAI")]
-    [string]$Provider = "Google",
+    [ValidateSet("LibreTranslate", "OpenAI")]
+    [string]$Provider = "LibreTranslate",
 
     [string]$Model = $(if ($env:OPENAI_MODEL) { $env:OPENAI_MODEL } else { "gpt-5.6" })
 )
@@ -65,96 +65,206 @@ function Get-ResponseText($Response) {
     return $null
 }
 
-function Invoke-GoogleTranslation(
-    [string]$Language,
-    [System.Collections.Specialized.OrderedDictionary]$Master,
-    [string]$ApiKey
+function Update-LanguageIndex(
+    [string]$IndexPath,
+    [string]$MasterLanguage,
+    [string[]]$GeneratedLanguages
 ) {
-    $keys = @($Master.Keys)
-    $values = @($keys | ForEach-Object { [string]$Master[$_] })
-
-    # Protect placeholders from machine translation by replacing them with
-    # neutral tokens, then restore the exact original placeholders afterwards.
-    $protectedValues = New-Object System.Collections.Generic.List[string]
-    $placeholderMaps = New-Object System.Collections.Generic.List[object]
-
-    foreach ($value in $values) {
-        $map = [ordered]@{}
-        $protected = $value
-        $matches = @([regex]::Matches($value, '\{[A-Za-z0-9_.-]+\}'))
-
-        for ($i = 0; $i -lt $matches.Count; $i++) {
-            $token = "__PSTP_PLACEHOLDER_$i`__"
-            $map[$token] = $matches[$i].Value
-            $protected = $protected.Replace($matches[$i].Value, $token)
-        }
-
-        $protectedValues.Add($protected)
-        $placeholderMaps.Add($map)
+    if (-not (Test-Path -LiteralPath $IndexPath -PathType Leaf)) {
+        Stop-Tool "Language index file not found: $IndexPath"
     }
 
-    $translatedValues = New-Object System.Collections.Generic.List[string]
+    $content = Get-Content -LiteralPath $IndexPath -Raw -Encoding UTF8
+    $match = [regex]::Match(
+        $content,
+        'languages\s*:\s*\[(?<items>[^\]]*)\]',
+        [System.Text.RegularExpressions.RegexOptions]::Singleline
+    )
 
-    # Google Cloud Translation Basic accepts at most 128 strings per request.
-    for ($offset = 0; $offset -lt $protectedValues.Count; $offset += 128) {
-        $end = [Math]::Min($offset + 127, $protectedValues.Count - 1)
-        $batch = @($protectedValues[$offset..$end])
+    if (-not $match.Success) {
+        Stop-Tool "Could not find the languages array in: $IndexPath"
+    }
 
-        $body = [ordered]@{
-            q = $batch
-            source = "en"
-            target = $Language
-            format = "text"
-        } | ConvertTo-Json -Depth 10
+    $languages = New-Object System.Collections.Generic.List[string]
+    $languages.Add($MasterLanguage)
 
-        $headers = @{
-            "X-goog-api-key" = $ApiKey
-            "Content-Type" = "application/json; charset=utf-8"
+    foreach ($item in [regex]::Matches($match.Groups["items"].Value, '["''](?<code>[^"'']+)["'']')) {
+        $code = $item.Groups["code"].Value
+        if ($code -cne $MasterLanguage -and -not $languages.Contains($code)) {
+            $languages.Add($code)
         }
+    }
+
+    foreach ($code in $GeneratedLanguages) {
+        if ($code -cne $MasterLanguage -and -not $languages.Contains($code)) {
+            $languages.Add($code)
+        }
+    }
+
+    $indent = "  "
+    $itemIndent = "    "
+    $languageLines = @()
+
+    for ($i = 0; $i -lt $languages.Count; $i++) {
+        $comma = if ($i -lt ($languages.Count - 1)) { "," } else { "" }
+        $languageLines += $itemIndent + '"' + $languages[$i] + '"' + $comma
+    }
+
+    $replacement = "languages: [`r`n" +
+        ($languageLines -join "`r`n") +
+        "`r`n$indent]" 
+
+    $updated = $content.Substring(0, $match.Index) +
+        $replacement +
+        $content.Substring($match.Index + $match.Length)
+
+    if ($updated -cne $content) {
+        [System.IO.File]::WriteAllText(
+            $IndexPath,
+            $updated,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Write-Ok "Updated language index: $IndexPath"
+    }
+    else {
+        Write-Ok "Language index already up to date"
+    }
+}
+
+function Start-LibreTranslateIfNeeded(
+    [string]$Uri = "http://127.0.0.1:5000"
+) {
+    try {
+        $null = Invoke-RestMethod -Method Get -Uri "$Uri/languages" -TimeoutSec 2
+        Write-Ok "LibreTranslate is already running"
+        return
+    }
+    catch {
+        # Not running yet.
+    }
+
+    $command = Get-Command libretranslate -ErrorAction SilentlyContinue
+    if (-not $command) {
+        Stop-Tool "LibreTranslate is not installed. Run: pip install libretranslate"
+    }
+
+    Write-Step "Starting LibreTranslate"
+
+    try {
+        Start-Process `
+            -FilePath $command.Source `
+            -ArgumentList @("--load-only", "en,de,fr,es,it") `
+            -WindowStyle Hidden | Out-Null
+    }
+    catch {
+        Stop-Tool "Could not start LibreTranslate: $($_.Exception.Message)"
+    }
+
+    $deadline = (Get-Date).AddMinutes(3)
+
+    do {
+        Start-Sleep -Seconds 2
 
         try {
-            $response = Invoke-RestMethod `
-                -Method Post `
-                -Uri "https://translation.googleapis.com/language/translate/v2" `
-                -Headers $headers `
-                -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
+            $null = Invoke-RestMethod -Method Get -Uri "$Uri/languages" -TimeoutSec 2
+            Write-Ok "LibreTranslate started"
+            return
         }
         catch {
-            $details = $null
-
-            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-                $details = $_.ErrorDetails.Message
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($details)) {
-                throw "Google Translation API error: $details"
-            }
-
-            throw
-        }
-
-        foreach ($translation in @($response.data.translations)) {
-            $translatedValues.Add(
-                [System.Net.WebUtility]::HtmlDecode([string]$translation.translatedText)
-            )
+            # Models/server may still be loading.
         }
     }
+    while ((Get-Date) -lt $deadline)
 
-    if ($translatedValues.Count -ne $values.Count) {
-        throw "Google returned $($translatedValues.Count) translations; expected $($values.Count)."
+    Stop-Tool "LibreTranslate did not become ready within 3 minutes."
+}
+
+function Invoke-LibreTranslateTranslation(
+    [string]$Language,
+    [System.Collections.Specialized.OrderedDictionary]$Master,
+    [string]$Uri = "http://127.0.0.1:5000"
+) {
+    $target = ($Language -split '-')[0].ToLowerInvariant()
+
+    # LibreTranslate does not distinguish en-GB from en-US.
+    if ($target -eq "en") {
+        $copy = [ordered]@{}
+        foreach ($key in $Master.Keys) {
+            $copy[$key] = [string]$Master[$key]
+        }
+        return $copy
     }
 
     $result = [ordered]@{}
 
-    for ($i = 0; $i -lt $keys.Count; $i++) {
-        $translated = $translatedValues[$i]
-        $map = $placeholderMaps[$i]
+    foreach ($key in $Master.Keys) {
+        $source = [string]$Master[$key]
 
-        foreach ($token in $map.Keys) {
-            $translated = $translated.Replace($token, [string]$map[$token])
+        # Split around placeholders. Placeholders themselves are never sent to
+        # LibreTranslate, so they cannot be translated, reformatted or damaged.
+        $parts = [regex]::Split($source, '(\{[A-Za-z0-9_.-]+\})')
+        $translatedParts = New-Object System.Collections.Generic.List[string]
+
+        foreach ($part in $parts) {
+            if ([string]::IsNullOrEmpty($part)) {
+                continue
+            }
+
+            if ($part -match '^\{[A-Za-z0-9_.-]+\}$') {
+                $translatedParts.Add($part)
+                continue
+            }
+
+            # Preserve whitespace-only segments exactly.
+            if ([string]::IsNullOrWhiteSpace($part)) {
+                $translatedParts.Add($part)
+                continue
+            }
+
+            $leadingWhitespace = [regex]::Match($part, '^\s*').Value
+            $trailingWhitespace = [regex]::Match($part, '\s*$').Value
+            $contentLength = $part.Length - $leadingWhitespace.Length - $trailingWhitespace.Length
+
+            if ($contentLength -le 0) {
+                $translatedParts.Add($part)
+                continue
+            }
+
+            $content = $part.Substring($leadingWhitespace.Length, $contentLength)
+
+            $body = [ordered]@{
+                q      = $content
+                source = "en"
+                target = $target
+                format = "text"
+            } | ConvertTo-Json -Depth 10
+
+            try {
+                $response = Invoke-RestMethod `
+                    -Method Post `
+                    -Uri "$Uri/translate" `
+                    -ContentType "application/json; charset=utf-8" `
+                    -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
+            }
+            catch {
+                $details = if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                    $_.ErrorDetails.Message
+                }
+                else {
+                    $_.Exception.Message
+                }
+
+                throw "LibreTranslate error for '$key': $details"
+            }
+
+            $translatedParts.Add(
+                $leadingWhitespace +
+                [string]$response.translatedText +
+                $trailingWhitespace
+            )
         }
 
-        $result[$keys[$i]] = $translated
+        $result[$key] = $translatedParts -join ""
     }
 
     return $result
@@ -359,12 +469,16 @@ if ($master.Count -eq 0) {
 Write-Ok "Master language loaded: $($master.Count) strings"
 
 switch ($Provider) {
-    "Google" {
-        if ([string]::IsNullOrWhiteSpace($env:GOOGLE_TRANSLATE_API_KEY)) {
-            Stop-Tool "GOOGLE_TRANSLATE_API_KEY is not set. Set it before generating translations."
-        }
+    "LibreTranslate" {
+        Write-Ok "Translation provider: LibreTranslate (local/free)"
 
-        Write-Ok "Translation provider: Google Cloud Translation"
+        $needsLibreTranslate = @(
+            $Languages | Where-Object { (($_ -split '-')[0]).ToLowerInvariant() -ne "en" }
+        ).Count -gt 0
+
+        if ($needsLibreTranslate) {
+            Start-LibreTranslateIfNeeded
+        }
     }
 
     "OpenAI" {
@@ -385,11 +499,10 @@ foreach ($language in $Languages) {
 
     try {
         switch ($Provider) {
-            "Google" {
-                $translated = Invoke-GoogleTranslation `
+            "LibreTranslate" {
+                $translated = Invoke-LibreTranslateTranslation `
                     -Language $language `
-                    -Master $master `
-                    -ApiKey $env:GOOGLE_TRANSLATE_API_KEY
+                    -Master $master
             }
 
             "OpenAI" {
@@ -475,6 +588,13 @@ foreach ($language in $Languages) {
 
     Write-Ok "Created: $targetPath"
 }
+
+$indexPath = Join-Path $fullI18nFolder "index.js"
+Write-Step "Updating language index"
+Update-LanguageIndex `
+    -IndexPath $indexPath `
+    -MasterLanguage "en-GB" `
+    -GeneratedLanguages $Languages
 
 Write-Host ""
 Write-Host "========================================================="
