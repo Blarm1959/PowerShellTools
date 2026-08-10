@@ -5,8 +5,8 @@
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$Languages,
 
-    [ValidateSet("Google", "OpenAI")]
-    [string]$Provider = "Google",
+    [ValidateSet("LibreTranslate", "OpenAI")]
+    [string]$Provider = "LibreTranslate",
 
     [string]$Model = $(if ($env:OPENAI_MODEL) { $env:OPENAI_MODEL } else { "gpt-5.6" })
 )
@@ -65,23 +65,47 @@ function Get-ResponseText($Response) {
     return $null
 }
 
-function Invoke-GoogleTranslation(
+function Invoke-LibreTranslate(
     [string]$Language,
     [System.Collections.Specialized.OrderedDictionary]$Master,
-    [string]$ApiKey
+    [string]$Uri = "http://127.0.0.1:5000"
 ) {
-    $keys = @($Master.Keys)
-    $values = @($keys | ForEach-Object { [string]$Master[$_] })
+    # LibreTranslate/Argos uses base language codes rather than BCP 47 regions.
+    $target = ($Language -split '-')[0].ToLowerInvariant()
 
-    # Protect placeholders from machine translation by replacing them with
-    # neutral tokens, then restore the exact original placeholders afterwards.
-    $protectedValues = New-Object System.Collections.Generic.List[string]
-    $placeholderMaps = New-Object System.Collections.Generic.List[object]
+    # en-US cannot be machine-translated from en-GB by LibreTranslate because
+    # both map to English. For this locale, preserve the master wording; the
+    # file can be reviewed for US spelling separately if desired.
+    if ($target -eq "en") {
+        $copy = [ordered]@{}
+        foreach ($key in $Master.Keys) {
+            $copy[$key] = [string]$Master[$key]
+        }
+        return $copy
+    }
 
-    foreach ($value in $values) {
+    try {
+        $available = Invoke-RestMethod -Method Get -Uri "$Uri/languages"
+    }
+    catch {
+        throw "LibreTranslate is not running at $Uri. Start it with: libretranslate --load-only en,de,fr,es,it"
+    }
+
+    $supported = @($available | ForEach-Object { $_.code })
+    if ($supported -notcontains "en") {
+        throw "LibreTranslate does not have the English model loaded."
+    }
+    if ($supported -notcontains $target) {
+        throw "LibreTranslate does not have '$target' loaded for $Language."
+    }
+
+    $result = [ordered]@{}
+
+    foreach ($key in $Master.Keys) {
+        $source = [string]$Master[$key]
+        $protected = $source
         $map = [ordered]@{}
-        $protected = $value
-        $matches = @([regex]::Matches($value, '\{[A-Za-z0-9_.-]+\}'))
+        $matches = @([regex]::Matches($source, '\{[A-Za-z0-9_.-]+\}'))
 
         for ($i = 0; $i -lt $matches.Count; $i++) {
             $token = "__PSTP_PLACEHOLDER_$i`__"
@@ -89,72 +113,35 @@ function Invoke-GoogleTranslation(
             $protected = $protected.Replace($matches[$i].Value, $token)
         }
 
-        $protectedValues.Add($protected)
-        $placeholderMaps.Add($map)
-    }
-
-    $translatedValues = New-Object System.Collections.Generic.List[string]
-
-    # Google Cloud Translation Basic accepts at most 128 strings per request.
-    for ($offset = 0; $offset -lt $protectedValues.Count; $offset += 128) {
-        $end = [Math]::Min($offset + 127, $protectedValues.Count - 1)
-        $batch = @($protectedValues[$offset..$end])
-
         $body = [ordered]@{
-            q = $batch
+            q = $protected
             source = "en"
-            target = $Language
+            target = $target
             format = "text"
         } | ConvertTo-Json -Depth 10
-
-        $headers = @{
-            "X-goog-api-key" = $ApiKey
-            "Content-Type" = "application/json; charset=utf-8"
-        }
 
         try {
             $response = Invoke-RestMethod `
                 -Method Post `
-                -Uri "https://translation.googleapis.com/language/translate/v2" `
-                -Headers $headers `
+                -Uri "$Uri/translate" `
+                -ContentType "application/json; charset=utf-8" `
                 -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
         }
         catch {
-            $details = $null
-
-            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-                $details = $_.ErrorDetails.Message
+            $details = if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                $_.ErrorDetails.Message
+            } else {
+                $_.Exception.Message
             }
-
-            if (-not [string]::IsNullOrWhiteSpace($details)) {
-                throw "Google Translation API error: $details"
-            }
-
-            throw
+            throw "LibreTranslate error for '$key': $details"
         }
 
-        foreach ($translation in @($response.data.translations)) {
-            $translatedValues.Add(
-                [System.Net.WebUtility]::HtmlDecode([string]$translation.translatedText)
-            )
-        }
-    }
-
-    if ($translatedValues.Count -ne $values.Count) {
-        throw "Google returned $($translatedValues.Count) translations; expected $($values.Count)."
-    }
-
-    $result = [ordered]@{}
-
-    for ($i = 0; $i -lt $keys.Count; $i++) {
-        $translated = $translatedValues[$i]
-        $map = $placeholderMaps[$i]
-
+        $translated = [string]$response.translatedText
         foreach ($token in $map.Keys) {
             $translated = $translated.Replace($token, [string]$map[$token])
         }
 
-        $result[$keys[$i]] = $translated
+        $result[$key] = $translated
     }
 
     return $result
@@ -359,12 +346,8 @@ if ($master.Count -eq 0) {
 Write-Ok "Master language loaded: $($master.Count) strings"
 
 switch ($Provider) {
-    "Google" {
-        if ([string]::IsNullOrWhiteSpace($env:GOOGLE_TRANSLATE_API_KEY)) {
-            Stop-Tool "GOOGLE_TRANSLATE_API_KEY is not set. Set it before generating translations."
-        }
-
-        Write-Ok "Translation provider: Google Cloud Translation"
+    "LibreTranslate" {
+        Write-Ok "Translation provider: LibreTranslate (local/free)"
     }
 
     "OpenAI" {
@@ -385,11 +368,10 @@ foreach ($language in $Languages) {
 
     try {
         switch ($Provider) {
-            "Google" {
-                $translated = Invoke-GoogleTranslation `
+            "LibreTranslate" {
+                $translated = Invoke-LibreTranslate `
                     -Language $language `
-                    -Master $master `
-                    -ApiKey $env:GOOGLE_TRANSLATE_API_KEY
+                    -Master $master
             }
 
             "OpenAI" {
