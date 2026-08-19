@@ -1343,6 +1343,54 @@ function Get-TargetVersion
         $ProjectContext.TargetVersion = $Explicit.ToString()
         $ProjectContext.ReleaseType = "Explicit"
     }
+    elseif ($ProjectContext.SourceMode -eq "Zip")
+    {
+        if ($null -eq $ProjectContext.SourceZip)
+        {
+            Stop-ProjectRelease "Change Package information is not available."
+        }
+
+        $EscapedProjectName = [regex]::Escape($ProjectContext.ProjectName)
+        $ZipPattern = "^$EscapedProjectName-Changes-v(\d+(?:\.\d+){0,2})\.zip$"
+
+        if ($ProjectContext.SourceZip.Name -notmatch $ZipPattern)
+        {
+            Stop-ProjectRelease (
+                "Change Package filename must contain a valid release version. " +
+                "Examples: " +
+                "$($ProjectContext.ProjectName)-Changes-v29.zip, " +
+                "$($ProjectContext.ProjectName)-Changes-v2.13.zip, " +
+                "$($ProjectContext.ProjectName)-Changes-v4.3.24.zip"
+            )
+        }
+
+        $ZipVersionText = $Matches[1]
+        $Parts = @($ZipVersionText.Split("."))
+
+        $NormalisedZipVersion =
+            switch ($Parts.Count)
+            {
+                1 { "0.0.$($Parts[0])" }
+                2 { "0.$($Parts[0]).$($Parts[1])" }
+                3 { "$($Parts[0]).$($Parts[1]).$($Parts[2])" }
+                default { Stop-ProjectRelease "Invalid Change Package version: $ZipVersionText" }
+            }
+
+        $PackageVersion = Test-SemanticVersion `
+            -Value $NormalisedZipVersion `
+            -Description "Change Package version"
+
+        if ($PackageVersion -le $Current)
+        {
+            Stop-ProjectRelease (
+                "Change Package version $NormalisedZipVersion must be greater " +
+                "than the current version $($ProjectContext.CurrentVersion)."
+            )
+        }
+
+        $ProjectContext.TargetVersion = $PackageVersion.ToString()
+        $ProjectContext.ReleaseType = "Package"
+    }
     else
     {
         $ProjectContext.TargetVersion =
