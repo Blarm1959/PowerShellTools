@@ -1408,17 +1408,6 @@ function Get-TargetVersion
     $ProjectContext.CommitMessage =
         "Release $($ProjectContext.ProjectName) $($ProjectContext.TargetTag)"
 
-    if ($null -ne $ProjectContext.Release -and
-        -not [string]::IsNullOrWhiteSpace([string]$ProjectContext.Release.commit))
-    {
-        $Template = [string]$ProjectContext.Release.commit
-        # Replace the v-prefixed version first. Replacing the bare version first
-        # would change v0.0.25 to v0.0.26 before the full tag can be matched.
-        $Template = $Template.Replace("v$($ProjectContext.CurrentVersion)",$ProjectContext.TargetTag)
-        $Template = $Template.Replace($ProjectContext.CurrentVersion,$ProjectContext.TargetVersion)
-        $ProjectContext.CommitMessage = $Template
-    }
-
     if (-not $ProjectContext.IsNewProject)
     {
         switch ($ProjectContext.SourceMode)
