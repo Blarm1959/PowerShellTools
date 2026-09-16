@@ -9,7 +9,7 @@
           Uses changes already present in the local Git working folder.
 
       -Zip
-          Finds the highest <Project>-Changes-gN.zip file in Windows Downloads,
+          Finds the newest <Project>-Changes*.zip file in Windows Downloads,
           imports only its changed files, and then continues as a local release.
 
       -Dummy
@@ -1351,29 +1351,44 @@ function Get-TargetVersion
         }
 
         $EscapedProjectName = [regex]::Escape($ProjectContext.ProjectName)
-        $ZipPattern = "^$EscapedProjectName-Changes-g([1-9]\d*)\.zip$"
+        $ZipPattern = "^$EscapedProjectName-Changes-v(\d+(?:\.\d+){0,2})\.zip$"
 
         if ($ProjectContext.SourceZip.Name -notmatch $ZipPattern)
         {
             Stop-ProjectRelease (
-                "Change Package filename must contain a valid generation number. " +
-                "Example: $($ProjectContext.ProjectName)-Changes-g3.zip"
+                "Change Package filename must contain a valid release version. " +
+                "Examples: " +
+                "$($ProjectContext.ProjectName)-Changes-v29.zip, " +
+                "$($ProjectContext.ProjectName)-Changes-v2.13.zip, " +
+                "$($ProjectContext.ProjectName)-Changes-v4.3.24.zip"
             )
         }
 
-        $PackageGeneration = [long]$Matches[1]
+        $ZipVersionText = $Matches[1]
+        $Parts = @($ZipVersionText.Split("."))
 
-        Write-Status `
-            -Status Success `
-            -Message "Change Package generation: g$PackageGeneration"
+        $NormalisedZipVersion =
+            switch ($Parts.Count)
+            {
+                1 { "0.0.$($Parts[0])" }
+                2 { "0.$($Parts[0]).$($Parts[1])" }
+                3 { "$($Parts[0]).$($Parts[1]).$($Parts[2])" }
+                default { Stop-ProjectRelease "Invalid Change Package version: $ZipVersionText" }
+            }
 
-        $ProjectContext.TargetVersion =
-            ([version]::new(
-                $Current.Major,
-                $Current.Minor,
-                $Current.Build + 1
-            )).ToString()
+        $PackageVersion = Test-SemanticVersion `
+            -Value $NormalisedZipVersion `
+            -Description "Change Package version"
 
+        if ($PackageVersion -le $Current)
+        {
+            Stop-ProjectRelease (
+                "Change Package version $NormalisedZipVersion must be greater " +
+                "than the current version $($ProjectContext.CurrentVersion)."
+            )
+        }
+
+        $ProjectContext.TargetVersion = $PackageVersion.ToString()
         $ProjectContext.ReleaseType = "Package"
     }
     else
@@ -1991,26 +2006,16 @@ function Get-LatestChangePackage
         Get-WindowsDownloadsFolder
 
     $Pattern =
-        "$($ProjectContext.ProjectName)-Changes-g*.zip"
-
-    $EscapedProjectName = [regex]::Escape($ProjectContext.ProjectName)
-    $ZipPattern = "^$EscapedProjectName-Changes-g([1-9]\d*)\.zip$"
+        "$($ProjectContext.ProjectName)-Changes*.zip"
 
     $Packages = @(
         Get-ChildItem `
             -LiteralPath $ProjectContext.DownloadsFolder `
             -Filter $Pattern `
             -File |
-        ForEach-Object {
-            if ($_.Name -match $ZipPattern)
-            {
-                [PSCustomObject]@{
-                    File       = $_
-                    Generation = [long]$Matches[1]
-                }
-            }
-        } |
-        Sort-Object -Property Generation -Descending
+        Sort-Object `
+            -Property LastWriteTime, Name `
+            -Descending
     )
 
     if ($Packages.Count -eq 0)
@@ -2019,7 +2024,7 @@ function Get-LatestChangePackage
             "No '$Pattern' file was found in $($ProjectContext.DownloadsFolder)"
     }
 
-    $ProjectContext.SourceZip = $Packages[0].File
+    $ProjectContext.SourceZip = $Packages[0]
 
     Write-Status `
         -Status Success `
