@@ -6,15 +6,15 @@ These rules apply to all projects managed using PowerShellTools / PSTP.
 
 Change packages created during ChatGPT development work must be named:
 
-`<Project>-Changes-gN.zip`
+`<Project>-Changes-v<version>.zip`
 
 Examples:
 
-`EnergyWatch-Changes-g1.zip`
-`EnergyWatch-Changes-g2.zip`
-`Quarto-Changes-g3.zip`
+`EnergyWatch-Changes-v0.3.1.zip`
+`Lipfty-Changes-v9.0.1.zip`
+`Quarto-Changes-v0.4.0.zip`
 
-`gN` is the sequential generation number for change packages. It is separate from the project's release version.
+The version in the filename is the intended PSTP release version. The Change Package itself must not directly update PSTP-managed version files; PSTP performs those updates during `Release -Zip`.
 
 ## Package Contents
 
