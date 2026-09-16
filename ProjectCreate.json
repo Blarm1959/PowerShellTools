@@ -1,6 +1,7 @@
 {
   "files": [
     ".gitattributes",
-    "PSTP.ps1"
+    "PSTP.ps1",
+    "PSTP_RULES.md"
   ]
 }
