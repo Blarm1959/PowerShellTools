@@ -37,6 +37,7 @@
 #>
 
 # Version History
+# 2.6.0 - Added Git synchronisation pre-flight and isolated transactional release worktrees.
 # 2.5.0 - Added first-run UX, no-change detection, release plans, metadata diagnostics, project type and timing.
 # 2.4.2 - Added complete README creation and managed release-history initialisation.
 # 2.4.1 - Improved new-project detection, metadata messages and initial summary output.
@@ -70,7 +71,7 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.5.0"
+$ScriptVersion = "2.6.0"
 $BootstrapDefaults = [ordered]@{
     Version          = "0.0.1"
     ReleaseType      = "Initial"
@@ -132,6 +133,19 @@ $ProjectContext = [PSCustomObject]@{
     ProjectType         = "Generic"
     MetadataVersions    = @()
     NoChangesDetected   = $false
+    OriginalProjectFolder = $ProjectFolder
+    StartingBranch       = $null
+    StartingCommit       = $null
+    UpstreamBranch       = $null
+    HasUpstream          = $false
+    TransactionFolder    = $null
+    TransactionBranch    = $null
+    TransactionActive    = $false
+    TransactionPromoted  = $false
+    LocalTagCreated      = $false
+    RemotePushAttempted  = $false
+    BranchPushed         = $false
+    TagPushed            = $false
     Stopwatch           = [System.Diagnostics.Stopwatch]::StartNew()
 }
 
@@ -186,6 +200,12 @@ function Stop-ProjectRelease
         [ValidateNotNullOrEmpty()]
         [string]$Message
     )
+
+    if ($null -ne $script:ProjectContext -and
+        $script:ProjectContext.TransactionActive)
+    {
+        Rollback-ReleaseTransaction -ProjectContext $script:ProjectContext
+    }
 
     Write-Host ""
     Write-Host "=========================================================" -ForegroundColor Red
@@ -358,6 +378,275 @@ function Test-TargetTagAvailable
     Write-Status `
         -Status Success `
         -Message "Git tag is available: $($ProjectContext.TargetTag)"
+}
+
+function Get-CurrentGitBranch
+{
+    $Branch = (git.exe branch --show-current).Trim()
+
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($Branch))
+    {
+        throw "PSTP requires a checked-out branch; detached HEAD is not supported."
+    }
+
+    return $Branch
+}
+
+function Test-GitSynchronisation
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    try
+    {
+        Push-Location $ProjectContext.ProjectFolder
+
+        Write-Status -Status Progress -Message "Checking Git synchronisation"
+
+        $OriginUrl = (git.exe remote get-url origin).Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($OriginUrl))
+        {
+            throw "The Git remote 'origin' is required for PSTP releases."
+        }
+
+        $InitialStatus = @(Get-GitStatus)
+        if ($InitialStatus.Count -gt 0)
+        {
+            throw "The Git working tree must be clean before PSTP starts."
+        }
+
+        Write-Status -Status Success -Message "Working tree clean"
+
+        Invoke-NativeCommand -Command "git.exe" -Arguments @("fetch", "origin", "--prune")
+        Write-Status -Status Success -Message "Fetched origin"
+
+        $ProjectContext.StartingBranch = Get-CurrentGitBranch
+        Write-Status -Status Success -Message "Branch: $($ProjectContext.StartingBranch)"
+
+        $Upstream = git.exe rev-parse --abbrev-ref --symbolic-full-name "@{upstream}" 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($Upstream -join "").Trim()))
+        {
+            $ProjectContext.UpstreamBranch = ($Upstream -join "").Trim()
+            $ProjectContext.HasUpstream = $true
+
+            if (-not $ProjectContext.UpstreamBranch.StartsWith("origin/"))
+            {
+                throw "Branch '$($ProjectContext.StartingBranch)' tracks '$($ProjectContext.UpstreamBranch)', not origin. Resolve the branch before running PSTP again."
+            }
+
+            $Counts = @(git.exe rev-list --left-right --count "HEAD...$($ProjectContext.UpstreamBranch)")
+            if ($LASTEXITCODE -ne 0 -or $Counts.Count -ne 1)
+            {
+                throw "Unable to compare the local branch with $($ProjectContext.UpstreamBranch)."
+            }
+
+            $Parts = @($Counts[0].Trim() -split '\s+')
+            if ($Parts.Count -ne 2)
+            {
+                throw "Unable to interpret the Git branch comparison."
+            }
+
+            $Ahead = [int]$Parts[0]
+            $Behind = [int]$Parts[1]
+
+            if ($Ahead -gt 0 -and $Behind -gt 0)
+            {
+                throw "Local and GitHub branches have diverged.`n       Release has not started.`n       Resolve the Git branch before running PSTP again."
+            }
+
+            if ($Behind -gt 0)
+            {
+                Write-Status -Status Progress -Message "Local branch is $Behind commits behind $($ProjectContext.UpstreamBranch)"
+
+                if ($ProjectContext.DryRun)
+                {
+                    Write-Status -Status Warning -Message "Dry run: would fast-forward to latest GitHub version"
+                }
+                else
+                {
+                    Invoke-NativeCommand -Command "git.exe" -Arguments @("merge", "--ff-only", $ProjectContext.UpstreamBranch)
+                    Write-Status -Status Success -Message "Fast-forwarded to latest GitHub version"
+                }
+            }
+            elseif ($Ahead -gt 0)
+            {
+                Write-Status -Status Success -Message "Local branch is $Ahead commits ahead of $($ProjectContext.UpstreamBranch)"
+            }
+            else
+            {
+                Write-Status -Status Success -Message "Local branch matches $($ProjectContext.UpstreamBranch)"
+            }
+        }
+        else
+        {
+            $ProjectContext.HasUpstream = $false
+            Write-Status -Status Warning -Message "Branch has no upstream; it will be published with git push -u origin $($ProjectContext.StartingBranch)"
+        }
+
+        if (-not $ProjectContext.DryRun)
+        {
+            $ProjectContext.StartingCommit = Get-GitHead
+        }
+    }
+    catch
+    {
+        Stop-ProjectRelease $_.Exception.Message
+    }
+    finally
+    {
+        Pop-Location
+    }
+}
+
+function Start-ReleaseTransaction
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    if ($ProjectContext.DryRun) { return }
+
+    try
+    {
+        $ProjectContext.TransactionFolder = Join-Path $env:TEMP ("BlarmPstpTransaction-" + [guid]::NewGuid().ToString("N"))
+        $ProjectContext.TransactionBranch = "pstp-transaction-" + [guid]::NewGuid().ToString("N")
+        $ProjectContext.TransactionActive = $true
+
+        Push-Location $ProjectContext.OriginalProjectFolder
+        try
+        {
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("worktree", "add", "--detach", $ProjectContext.TransactionFolder, $ProjectContext.StartingCommit)
+        }
+        finally { Pop-Location }
+
+        Push-Location $ProjectContext.TransactionFolder
+        try
+        {
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("switch", "-c", $ProjectContext.TransactionBranch)
+        }
+        finally { Pop-Location }
+
+        $ProjectContext.ProjectFolder = $ProjectContext.TransactionFolder
+        Write-Status -Status Success -Message "Release transaction prepared"
+    }
+    catch
+    {
+        Stop-ProjectRelease $_.Exception.Message
+    }
+}
+
+function Complete-ReleaseTransaction
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    if ($ProjectContext.DryRun) { return }
+
+    try
+    {
+        Push-Location $ProjectContext.OriginalProjectFolder
+        Invoke-NativeCommand -Command "git.exe" -Arguments @("merge", "--ff-only", $ProjectContext.TransactionBranch)
+        $ProjectContext.TransactionPromoted = $true
+        $ProjectContext.ProjectFolder = $ProjectContext.OriginalProjectFolder
+        Write-Status -Status Success -Message "Prepared release fast-forwarded locally"
+
+        $ProjectContext.RemotePushAttempted = $true
+        if ($ProjectContext.HasUpstream)
+        {
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("push")
+        }
+        else
+        {
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("push", "-u", "origin", $ProjectContext.StartingBranch)
+        }
+        $ProjectContext.BranchPushed = $true
+        Write-Status -Status Success -Message "Changes pushed"
+
+        if (-not $ProjectContext.NoBump)
+        {
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("push", "origin", $ProjectContext.TargetTag)
+            $ProjectContext.TagPushed = $true
+            Write-Status -Status Success -Message "Tag pushed: $($ProjectContext.TargetTag)"
+        }
+
+        $FinalStatus = @(Get-GitStatus)
+        if ($FinalStatus.Count -gt 0)
+        {
+            throw "The Git working tree is not clean after publishing."
+        }
+    }
+    catch
+    {
+        if ($ProjectContext.BranchPushed -and
+            -not $ProjectContext.NoBump -and
+            -not $ProjectContext.TagPushed)
+        {
+            Stop-ProjectRelease "Release commits were pushed to GitHub, but the tag could not be pushed. The local tag remains. Push '$($ProjectContext.TargetTag)' manually after resolving the problem."
+        }
+
+        Stop-ProjectRelease "Git push was attempted and its remote result may be unknown. No automatic rollback has been attempted. Verify GitHub before taking further action. Original error: $($_.Exception.Message)"
+    }
+    finally
+    {
+        Pop-Location
+    }
+}
+
+function Rollback-ReleaseTransaction
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    if (-not $ProjectContext.TransactionActive) { return }
+
+    try
+    {
+        if (-not $ProjectContext.RemotePushAttempted -and $ProjectContext.TransactionPromoted)
+        {
+            Push-Location $ProjectContext.OriginalProjectFolder
+            & git.exe reset --hard $ProjectContext.StartingCommit | Out-Null
+            Pop-Location
+            Write-Status -Status Success -Message "Local project restored to its starting commit"
+        }
+
+        if (-not $ProjectContext.RemotePushAttempted -and $ProjectContext.LocalTagCreated)
+        {
+            & git.exe -C $ProjectContext.OriginalProjectFolder tag -d $ProjectContext.TargetTag | Out-Null
+            Write-Status -Status Success -Message "Local release tag removed"
+        }
+
+        if (Test-Path -LiteralPath $ProjectContext.TransactionFolder)
+        {
+            & git.exe -C $ProjectContext.OriginalProjectFolder worktree remove --force $ProjectContext.TransactionFolder | Out-Null
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($ProjectContext.TransactionBranch))
+        {
+            & git.exe -C $ProjectContext.OriginalProjectFolder branch -D $ProjectContext.TransactionBranch 2>$null | Out-Null
+        }
+
+        $ProjectContext.ProjectFolder = $ProjectContext.OriginalProjectFolder
+        $ProjectContext.TransactionActive = $false
+    }
+    catch
+    {
+        Write-Status -Status Warning -Message "Automatic transaction cleanup was incomplete: $($_.Exception.Message)"
+    }
 }
 
 #endregion Native Commands and Git
@@ -2910,21 +3199,19 @@ function Publish-ProjectRelease
         }
 
         $ProjectContext.FinalCommit = Get-GitHead
-        Invoke-NativeCommand -Command "git.exe" -Arguments @("push")
-        Write-Status -Status Success -Message "Changes pushed"
 
         # NoBump deliberately creates no tag.
         if (-not $ProjectContext.NoBump)
         {
             Invoke-NativeCommand -Command "git.exe" -Arguments @("tag", $ProjectContext.TargetTag)
-            Invoke-NativeCommand -Command "git.exe" -Arguments @("push", "origin", $ProjectContext.TargetTag)
-            Write-Status -Status Success -Message "Tag created and pushed: $($ProjectContext.TargetTag)"
+            $ProjectContext.LocalTagCreated = $true
+            Write-Status -Status Success -Message "Local release tag created: $($ProjectContext.TargetTag)"
         }
 
         $FinalStatus = @(Get-GitStatus)
         if ($FinalStatus.Count -gt 0)
         {
-            throw "The Git working tree is not clean after publishing."
+            throw "The transaction working tree is not clean after preparing the release."
         }
     }
     catch
@@ -3059,6 +3346,12 @@ try
     Test-GitRepository `
         -ProjectContext $ProjectContext
 
+    Test-GitSynchronisation `
+        -ProjectContext $ProjectContext
+
+    Start-ReleaseTransaction `
+        -ProjectContext $ProjectContext
+
     Test-ProjectFiles `
         -ProjectContext $ProjectContext
 
@@ -3081,6 +3374,11 @@ try
     {
         Write-NothingToDoSummary `
             -ProjectContext $ProjectContext
+
+        if ($ProjectContext.TransactionActive)
+        {
+            Rollback-ReleaseTransaction -ProjectContext $ProjectContext
+        }
 
         exit 0
     }
@@ -3105,6 +3403,17 @@ try
 
     Publish-ProjectRelease `
         -ProjectContext $ProjectContext
+
+    Complete-ReleaseTransaction `
+        -ProjectContext $ProjectContext
+
+    if ($ProjectContext.TransactionActive)
+    {
+        # Successful publication retains the real branch and tag, but removes
+        # the disposable worktree and its private transaction branch.
+        $ProjectContext.RemotePushAttempted = $true
+        Rollback-ReleaseTransaction -ProjectContext $ProjectContext
+    }
 
     Write-ProjectSummary `
         -ProjectContext $ProjectContext
