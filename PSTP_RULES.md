@@ -86,6 +86,25 @@ The normal PowerShell approach is:
 
 Each project should maintain its own explicit list of files or folders that are outputs from a run and should be archived to `Old` before the next run.
 
+## App Repositories (public web apps from private source)
+
+A project can publish its runnable app to a separate public repository named `<Repo>-App` (for example `Lipfty` -> `Lipfty-App`) while its source repository stays private.
+
+- Publication is automatic: after every successful versioned `Release` (not `-NoBump`, not `-DryRun`), ProjectRelease checks for `<Repo>-App` next to the project folder, or on the same GitHub owner. If neither exists, nothing happens.
+- If the App repository exists on GitHub but not locally, it is cloned next to the project folder automatically.
+- The App repository mirrors the project's tracked files, excluding `tools/`, `docs/`, `test(s)/`, `Old/`, `.github/`, `.vs/`, `.vscode/`, `node_modules/`, `*.ps1`, `*.psm1`, `*.psd1`, `*.md`, `.git*` files, `package-lock.json` and `LICENSE`. Files removed from the app are removed from the App repository.
+- The App repository's own `README.md`, `LICENSE`, `CNAME`, `.nojekyll`, `.gitignore`, `.gitattributes` and `.github/` are never touched. `.nojekyll` is created if missing.
+- Each publication is committed as `Publish <Project> v<version>`, tagged `v<version>` and pushed. GitHub Pages on the App repository then serves the app.
+- A failed App publication is reported as a warning only; the main release has already been pushed. The next release republishes in full.
+- Optional per-project overrides in `release.json`:
+
+```json
+"app": {
+  "include": [ "tools/runtime-helper.js" ],
+  "exclude": [ "js/debug-*.js" ]
+}
+```
+
 ## Source of Truth
 
 These rules are the permanent development conventions for projects using PowerShellTools.

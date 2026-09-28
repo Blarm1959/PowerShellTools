@@ -26,6 +26,8 @@
       - records build information in a follow-up commit
       - pushes the commits
       - creates and pushes the Git tag
+      - publishes the app files to a public <Repo>-App repository,
+        when one exists (e.g. Lipfty -> Lipfty-App)
 
     Change Packages are transport packages only. They must not be treated as
     complete project or release ZIPs.
@@ -37,6 +39,7 @@
 #>
 
 # Version History
+# 2.7.0 - Automatic publication of app files to a public <Repo>-App repository.
 # 2.6.0 - Added Git synchronisation pre-flight and isolated transactional release worktrees.
 # 2.5.0 - Added first-run UX, no-change detection, release plans, metadata diagnostics, project type and timing.
 # 2.4.2 - Added complete README creation and managed release-history initialisation.
@@ -71,7 +74,7 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.6.0"
+$ScriptVersion = "2.7.0"
 $BootstrapDefaults = [ordered]@{
     Version          = "0.0.1"
     ReleaseType      = "Initial"
@@ -146,6 +149,8 @@ $ProjectContext = [PSCustomObject]@{
     RemotePushAttempted  = $false
     BranchPushed         = $false
     TagPushed            = $false
+    AppName              = $null
+    AppStatus            = $null
     Stopwatch           = [System.Diagnostics.Stopwatch]::StartNew()
 }
 
@@ -3226,6 +3231,331 @@ function Publish-ProjectRelease
 
 #endregion Git Publication
 
+#region App Repository Publication
+
+$AppDefaultExcludedFolders = @(
+    ".git"
+    ".github"
+    ".vs"
+    ".vscode"
+    "node_modules"
+    "tools"
+    "docs"
+    "test"
+    "tests"
+    "Old"
+)
+
+$AppDefaultExcludedPatterns = @(
+    "*.ps1"
+    "*.psm1"
+    "*.psd1"
+    "*.md"
+    ".gitignore"
+    ".gitattributes"
+    ".gitkeep"
+    "package-lock.json"
+    "LICENSE"
+    "LICENSE.*"
+)
+
+# Files in the App repository that PSTP never deletes or overwrites.
+$AppProtectedPatterns = @(
+    "README.md"
+    "LICENSE"
+    "LICENSE.*"
+    "CNAME"
+    ".nojekyll"
+    ".gitignore"
+    ".gitattributes"
+    ".github/*"
+)
+
+function Get-AppConfigList
+{
+    [CmdletBinding()]
+    param
+    (
+        [PSCustomObject]$ProjectContext,
+        [string]$Name
+    )
+
+    $Result = @()
+    $Release = $ProjectContext.Release
+
+    if ($null -ne $Release -and
+        $Release.PSObject.Properties.Name -contains "app" -and
+        $null -ne $Release.app -and
+        $Release.app.PSObject.Properties.Name -contains $Name)
+    {
+        $Result = @($Release.app.$Name | ForEach-Object { [string]$_ })
+    }
+
+    return $Result
+}
+
+function Test-AppPathMatch
+{
+    [CmdletBinding()]
+    param
+    (
+        [string]$RelativePath,
+        [string[]]$Patterns
+    )
+
+    $FileName = ($RelativePath -split "/")[-1]
+
+    foreach ($Pattern in $Patterns)
+    {
+        if ([string]::IsNullOrWhiteSpace($Pattern)) { continue }
+        $P = $Pattern.Replace("\", "/").TrimStart("/")
+
+        if ($RelativePath -like $P) { return $true }
+        if ($P -notlike "*/*" -and $FileName -like $P) { return $true }
+        if ($P.EndsWith("/") -and $RelativePath -like "$P*") { return $true }
+    }
+
+    return $false
+}
+
+function Test-AppFileIncluded
+{
+    [CmdletBinding()]
+    param
+    (
+        [string]$RelativePath,
+        [string[]]$ExtraIncludes,
+        [string[]]$ExtraExcludes
+    )
+
+    if (Test-AppPathMatch -RelativePath $RelativePath -Patterns $ExtraExcludes) { return $false }
+    if (Test-AppPathMatch -RelativePath $RelativePath -Patterns $ExtraIncludes) { return $true }
+
+    $FirstSegment = ($RelativePath -split "/")[0]
+    if (($RelativePath -split "/").Count -gt 1 -and
+        $AppDefaultExcludedFolders -contains $FirstSegment)
+    {
+        return $false
+    }
+
+    if (Test-AppPathMatch -RelativePath $RelativePath -Patterns $AppDefaultExcludedPatterns) { return $false }
+
+    return $true
+}
+
+function Publish-AppRepository
+{
+    <#
+        Publishes the released app files to a public "<Repo>-App" repository.
+
+        Runs automatically after a successful versioned release. Projects
+        without a "<Repo>-App" repository are skipped silently. Failures here
+        never affect the main release, which has already been pushed.
+
+        Optional release.json settings:
+          "app": {
+            "include": [ "tools/needed-at-runtime.js" ],
+            "exclude": [ "js/debug-*.js" ]
+          }
+    #>
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    # Native commands are checked via $LASTEXITCODE here; stderr output from
+    # git must not terminate the script under Windows PowerShell 5.1.
+    $ErrorActionPreference = "Continue"
+
+    if ($ProjectContext.NoBump) { return }
+
+    try
+    {
+        $Root = (& git.exe -C $ProjectContext.OriginalProjectFolder rev-parse --show-toplevel 2>$null)
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($Root)) { return }
+        $Root = [System.IO.Path]::GetFullPath(([string]$Root).Trim())
+
+        $OriginUrl = (& git.exe -C $Root remote get-url origin 2>$null)
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($OriginUrl)) { return }
+        $OriginUrl = ([string]$OriginUrl).Trim()
+
+        if ($OriginUrl -notmatch '^(?<base>.*[/:])(?<repo>[^/:]+?)(?:\.git)?/?$') { return }
+        $RepoName = $Matches["repo"]
+        if ($RepoName -like "*-App") { return }
+
+        $AppName = "$RepoName-App"
+        $AppUrl = "$($Matches['base'])$AppName.git"
+        $AppFolder = Join-Path (Split-Path $Root -Parent) $AppName
+        $ProjectContext.AppName = $AppName
+
+        if ($ProjectContext.DryRun)
+        {
+            Write-Status -Status Warning -Message "Dry run: $AppName would be published if it exists."
+            $ProjectContext.AppStatus = "Dry run"
+            return
+        }
+
+        # ---- Locate or clone the App repository -------------------------
+        if (Test-Path -LiteralPath (Join-Path $AppFolder ".git"))
+        {
+            Write-Status -Status Progress -Message "Updating $AppName"
+
+            $AppStatus = @(& git.exe -C $AppFolder status --porcelain)
+            if ($LASTEXITCODE -ne 0) { throw "Unable to read $AppName Git status." }
+            if ($AppStatus.Count -gt 0) { throw "$AppFolder has uncommitted changes." }
+
+            $HasCommits = $false
+            & git.exe -C $AppFolder rev-parse --verify -q HEAD *> $null
+            if ($LASTEXITCODE -eq 0) { $HasCommits = $true }
+
+            if ($HasCommits)
+            {
+                & git.exe -C $AppFolder pull --ff-only
+                if ($LASTEXITCODE -ne 0) { throw "Unable to pull $AppName (fast-forward only)." }
+            }
+        }
+        else
+        {
+            if (Test-Path -LiteralPath $AppFolder)
+            {
+                throw "$AppFolder exists but is not a Git repository."
+            }
+
+            # Probe quietly: a missing repository simply means "no App repo".
+            $OldPrompt = $env:GIT_TERMINAL_PROMPT
+            $OldGcm = $env:GCM_INTERACTIVE
+            try
+            {
+                $env:GIT_TERMINAL_PROMPT = "0"
+                $env:GCM_INTERACTIVE = "Never"
+                & git.exe ls-remote --heads $AppUrl *> $null
+                $Exists = ($LASTEXITCODE -eq 0)
+            }
+            finally
+            {
+                $env:GIT_TERMINAL_PROMPT = $OldPrompt
+                $env:GCM_INTERACTIVE = $OldGcm
+            }
+
+            if (-not $Exists)
+            {
+                $ProjectContext.AppStatus = "None"
+                return
+            }
+
+            Write-Status -Status Progress -Message "Cloning $AppName"
+            & git.exe clone $AppUrl $AppFolder
+            if ($LASTEXITCODE -ne 0) { throw "Unable to clone $AppUrl." }
+        }
+
+        # An empty repository has no branch yet; publish to main.
+        & git.exe -C $AppFolder rev-parse --verify -q HEAD *> $null
+        if ($LASTEXITCODE -ne 0)
+        {
+            & git.exe -C $AppFolder symbolic-ref HEAD refs/heads/main
+        }
+
+        # ---- Work out the app file set ----------------------------------
+        $Includes = @(Get-AppConfigList -ProjectContext $ProjectContext -Name "include")
+        $Excludes = @(Get-AppConfigList -ProjectContext $ProjectContext -Name "exclude")
+
+        $SourceFiles = @(& git.exe -C $Root -c core.quotepath=false ls-files)
+        if ($LASTEXITCODE -ne 0) { throw "Unable to list project files." }
+
+        $AppFiles = @(
+            $SourceFiles |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_) -and
+                (Test-AppFileIncluded -RelativePath $_ -ExtraIncludes $Includes -ExtraExcludes $Excludes) -and
+                -not (Test-AppPathMatch -RelativePath $_ -Patterns $AppProtectedPatterns)
+            }
+        )
+
+        if ($AppFiles.Count -eq 0) { throw "No app files were selected for publication." }
+
+        $AppFileSet = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($File in $AppFiles) { [void]$AppFileSet.Add($File) }
+
+        # ---- Mirror: remove files no longer part of the app -------------
+        $Existing = @(& git.exe -C $AppFolder -c core.quotepath=false ls-files)
+        $Removed = 0
+        foreach ($File in $Existing)
+        {
+            if ([string]::IsNullOrWhiteSpace($File)) { continue }
+            if ($AppFileSet.Contains($File)) { continue }
+            if (Test-AppPathMatch -RelativePath $File -Patterns $AppProtectedPatterns) { continue }
+
+            $Target = Join-Path $AppFolder ($File.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
+            if (Test-Path -LiteralPath $Target) { Remove-Item -LiteralPath $Target -Force -ErrorAction Stop }
+            $Removed++
+        }
+
+        # ---- Copy the current app files ---------------------------------
+        foreach ($File in $AppFiles)
+        {
+            $Source = Join-Path $Root ($File.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
+            $Target = Join-Path $AppFolder ($File.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
+            $TargetDir = Split-Path $Target -Parent
+
+            if (-not (Test-Path -LiteralPath $TargetDir))
+            {
+                [void](New-Item -ItemType Directory -Path $TargetDir -Force -ErrorAction Stop)
+            }
+
+            Copy-Item -LiteralPath $Source -Destination $Target -Force -ErrorAction Stop
+        }
+
+        $NoJekyll = Join-Path $AppFolder ".nojekyll"
+        if (-not (Test-Path -LiteralPath $NoJekyll))
+        {
+            [void](New-Item -ItemType File -Path $NoJekyll -Force -ErrorAction Stop)
+        }
+
+        # ---- Commit, tag and push ---------------------------------------
+        Invoke-NativeCommand -Command "git.exe" -Arguments @("-C", $AppFolder, "add", "--all")
+
+        $Pending = @(& git.exe -C $AppFolder status --porcelain)
+        if ($Pending.Count -gt 0)
+        {
+            Invoke-NativeCommand -Command "git.exe" -Arguments @(
+                "-C", $AppFolder, "commit", "-m",
+                "Publish $($ProjectContext.ProjectName) $($ProjectContext.TargetTag)"
+            )
+        }
+        else
+        {
+            Write-Status -Status Success -Message "$AppName files already up to date"
+        }
+
+        & git.exe -C $AppFolder rev-parse --verify -q "refs/tags/$($ProjectContext.TargetTag)" *> $null
+        $TagExists = ($LASTEXITCODE -eq 0)
+        if (-not $TagExists)
+        {
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("-C", $AppFolder, "tag", $ProjectContext.TargetTag)
+        }
+
+        Invoke-NativeCommand -Command "git.exe" -Arguments @("-C", $AppFolder, "push", "-u", "origin", "HEAD")
+        if (-not $TagExists)
+        {
+            Invoke-NativeCommand -Command "git.exe" -Arguments @("-C", $AppFolder, "push", "origin", $ProjectContext.TargetTag)
+        }
+
+        $ProjectContext.AppStatus = "Published $($ProjectContext.TargetTag) ($($AppFiles.Count) files, $Removed removed)"
+        Write-Status -Status Success -Message "$AppName published: $($ProjectContext.TargetTag)"
+    }
+    catch
+    {
+        $ProjectContext.AppStatus = "FAILED"
+        Write-Status -Status Warning -Message "App publication failed: $($_.Exception.Message)"
+        Write-Host "       The main release is complete and pushed. Fix the problem above;"
+        Write-Host "       the next release will republish $($ProjectContext.AppName) in full."
+    }
+}
+
+#endregion App Repository Publication
+
 #region Summary
 
 function Write-ProjectSummary
@@ -3304,6 +3634,12 @@ function Write-ProjectSummary
     }
 
     Write-Host "Dry Run         : $DryRunText"
+
+    if (-not [string]::IsNullOrWhiteSpace($ProjectContext.AppStatus) -and
+        $ProjectContext.AppStatus -ne "None")
+    {
+        Write-Host "App Repository  : $($ProjectContext.AppName) - $($ProjectContext.AppStatus)"
+    }
 
     if ($ProjectContext.IsNewProject -and
         $ProjectContext.CreatedFiles.Count -gt 0)
@@ -3414,6 +3750,9 @@ try
         $ProjectContext.RemotePushAttempted = $true
         Rollback-ReleaseTransaction -ProjectContext $ProjectContext
     }
+
+    Publish-AppRepository `
+        -ProjectContext $ProjectContext
 
     Write-ProjectSummary `
         -ProjectContext $ProjectContext
