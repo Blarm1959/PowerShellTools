@@ -10,6 +10,10 @@ Reusable PowerShell development tools.
 
 Each tool should depend on Core and remain independent of the other tools.
 
-## Check all repos
+## Update all repos
 
-Run `.\CheckRepos.ps1` from this folder on either laptop. It fetches every repo next to PowerShellTools and reports anything behind, ahead, diverged, uncommitted or stashed, then lists GitHub repos not cloned on this laptop (private ones too when `gh` is installed). Use `-NoFetch` to skip the fetch.
+Run `.\UpdateRepos.ps1` from this folder on either laptop. It fetches every repo next to PowerShellTools, fast-forwards every repo that is behind and has no local changes, clones every missing GitHub repo (including `-App` repos), then reports anything still ahead, diverged, uncommitted or stashed. Missing private repos are only found when `gh` is installed and logged in.
+
+- `-L` - list only: report status and missing repos without pulling or cloning.
+- `-NoFetch` - with `-L`, skip the fetch.
+- `-Exclude` - folder name patterns to skip (default `* - Copy`).
