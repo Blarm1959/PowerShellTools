@@ -39,6 +39,7 @@
 #>
 
 # Version History
+# 2.7.4 - Fixed new-project identity inside transactional worktrees.
 # 2.7.3 - Fixed -Local transactional releases and first -Zip releases for new projects.
 # 2.7.0 - Automatic publication of app files to a public <Repo>-App repository.
 # 2.6.0 - Added Git synchronisation pre-flight and isolated transactional release worktrees.
@@ -75,7 +76,7 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.7.3"
+$ScriptVersion = "2.7.4"
 $BootstrapDefaults = [ordered]@{
     Version          = "0.0.1"
     ReleaseType      = "Initial"
@@ -893,6 +894,10 @@ function Initialize-Project
             "Unable to resolve project folder: $($ProjectContext.ProjectFolder)"
     }
 
+    $ProjectContext.ProjectName = Split-Path `
+        -Path $ProjectContext.ProjectFolder `
+        -Leaf
+
     Write-Status `
         -Status Success `
         -Message "Project folder: $($ProjectContext.ProjectFolder)"
@@ -971,9 +976,7 @@ function New-InitialReleaseJson
         [PSCustomObject]$ProjectContext
     )
 
-    $ProjectName = Split-Path `
-        -Path $ProjectContext.ProjectFolder `
-        -Leaf
+    $ProjectName = $ProjectContext.ProjectName
 
     return [ordered]@{
         schemaVersion  = 1
@@ -1023,9 +1026,7 @@ function New-InitialReadmeContent
         [PSCustomObject]$ProjectContext
     )
 
-    $ProjectName = Split-Path `
-        -Path $ProjectContext.ProjectFolder `
-        -Leaf
+    $ProjectName = $ProjectContext.ProjectName
 
     $InitialTag = "v$($ProjectContext.InitialVersion)"
     $BeginMarker = "<!-- PROJECTRELEASE:BEGIN -->"
