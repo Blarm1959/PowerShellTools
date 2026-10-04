@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "project": "PowerShellTools",
-  "version": "2.7.2",
-  "githubSource": "v2.7.2",
+  "version": "2.7.3",
+  "githubSource": "v2.7.3",
   "zipPrefix": "PowerShellTools-",
   "port": 0,
   "packageChanges": false,

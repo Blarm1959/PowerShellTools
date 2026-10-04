@@ -39,6 +39,7 @@
 #>
 
 # Version History
+# 2.7.3 - Fixed -Local transactional releases and first -Zip releases for new projects.
 # 2.7.0 - Automatic publication of app files to a public <Repo>-App repository.
 # 2.6.0 - Added Git synchronisation pre-flight and isolated transactional release worktrees.
 # 2.5.0 - Added first-run UX, no-change detection, release plans, metadata diagnostics, project type and timing.
@@ -74,7 +75,7 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.7.0"
+$ScriptVersion = "2.7.3"
 $BootstrapDefaults = [ordered]@{
     Version          = "0.0.1"
     ReleaseType      = "Initial"
@@ -149,6 +150,8 @@ $ProjectContext = [PSCustomObject]@{
     RemotePushAttempted  = $false
     BranchPushed         = $false
     TagPushed            = $false
+    LocalStashRef        = $null
+    LocalStashMessage    = $null
     AppName              = $null
     AppStatus            = $null
     Stopwatch           = [System.Diagnostics.Stopwatch]::StartNew()
@@ -419,12 +422,21 @@ function Test-GitSynchronisation
         }
 
         $InitialStatus = @(Get-GitStatus)
-        if ($InitialStatus.Count -gt 0)
+
+        if ($ProjectContext.SourceMode -ne "Local" -and
+            $InitialStatus.Count -gt 0)
         {
             throw "The Git working tree must be clean before PSTP starts."
         }
 
-        Write-Status -Status Success -Message "Working tree clean"
+        if ($InitialStatus.Count -eq 0)
+        {
+            Write-Status -Status Success -Message "Working tree clean"
+        }
+        else
+        {
+            Write-Status -Status Success -Message "Local changes detected for release"
+        }
 
         Invoke-NativeCommand -Command "git.exe" -Arguments @("fetch", "origin", "--prune")
         Write-Status -Status Success -Message "Fetched origin"
@@ -538,6 +550,78 @@ function Start-ReleaseTransaction
         }
         finally { Pop-Location }
 
+
+        if ($ProjectContext.SourceMode -eq "Local")
+        {
+            Push-Location $ProjectContext.OriginalProjectFolder
+            try
+            {
+                $LocalStatus = @(Get-GitStatus)
+
+                if ($LocalStatus.Count -gt 0)
+                {
+                    $ProjectContext.LocalStashMessage =
+                        "PSTP local release " +
+                        [guid]::NewGuid().ToString("N")
+
+                    Invoke-NativeCommand `
+                        -Command "git.exe" `
+                        -Arguments @(
+                            "stash",
+                            "push",
+                            "--include-untracked",
+                            "-m",
+                            $ProjectContext.LocalStashMessage
+                        )
+
+                    $ProjectContext.LocalStashRef = (
+                        & git.exe rev-parse "stash@{0}"
+                    ).Trim()
+
+                    if ($LASTEXITCODE -ne 0 -or
+                        [string]::IsNullOrWhiteSpace(
+                            $ProjectContext.LocalStashRef
+                        ))
+                    {
+                        throw "Unable to identify the temporary PSTP local stash."
+                    }
+
+                    Write-Status `
+                        -Status Success `
+                        -Message "Local changes secured in temporary release stash"
+                }
+            }
+            finally
+            {
+                Pop-Location
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace(
+                $ProjectContext.LocalStashRef
+            ))
+            {
+                Push-Location $ProjectContext.TransactionFolder
+                try
+                {
+                    Invoke-NativeCommand `
+                        -Command "git.exe" `
+                        -Arguments @(
+                            "stash",
+                            "apply",
+                            "--index",
+                            $ProjectContext.LocalStashRef
+                        )
+                }
+                finally
+                {
+                    Pop-Location
+                }
+
+                Write-Status `
+                    -Status Success `
+                    -Message "Local changes copied into release transaction"
+            }
+        }
         $ProjectContext.ProjectFolder = $ProjectContext.TransactionFolder
         Write-Status -Status Success -Message "Release transaction prepared"
     }
@@ -608,6 +692,99 @@ function Complete-ReleaseTransaction
     }
 }
 
+function Remove-LocalReleaseStash
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ProjectContext.LocalStashRef))
+    {
+        return
+    }
+
+    $StashHashes = @(
+        & git.exe `
+            -C $ProjectContext.OriginalProjectFolder `
+            stash list `
+            --format="%H"
+    )
+
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw "Unable to read Git stash list."
+    }
+
+    $StashIndex = -1
+
+    for ($Index = 0; $Index -lt $StashHashes.Count; $Index++)
+    {
+        if ($StashHashes[$Index].Trim() -eq
+            $ProjectContext.LocalStashRef)
+        {
+            $StashIndex = $Index
+            break
+        }
+    }
+
+    if ($StashIndex -ge 0)
+    {
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @(
+                "-C",
+                $ProjectContext.OriginalProjectFolder,
+                "stash",
+                "drop",
+                "stash@{$StashIndex}"
+            )
+    }
+
+    $ProjectContext.LocalStashRef = $null
+    $ProjectContext.LocalStashMessage = $null
+}
+
+function Restore-LocalReleaseStash
+{
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$ProjectContext
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ProjectContext.LocalStashRef))
+    {
+        return
+    }
+
+    Push-Location $ProjectContext.OriginalProjectFolder
+    try
+    {
+        Invoke-NativeCommand `
+            -Command "git.exe" `
+            -Arguments @(
+                "stash",
+                "apply",
+                "--index",
+                $ProjectContext.LocalStashRef
+            )
+    }
+    finally
+    {
+        Pop-Location
+    }
+
+    Remove-LocalReleaseStash `
+        -ProjectContext $ProjectContext
+
+    Write-Status `
+        -Status Success `
+        -Message "Original local changes restored"
+}
 function Rollback-ReleaseTransaction
 {
     [CmdletBinding()]
@@ -645,6 +822,25 @@ function Rollback-ReleaseTransaction
             & git.exe -C $ProjectContext.OriginalProjectFolder branch -D $ProjectContext.TransactionBranch 2>$null | Out-Null
         }
 
+        if (-not [string]::IsNullOrWhiteSpace(
+            $ProjectContext.LocalStashRef
+        ))
+        {
+            if ($ProjectContext.RemotePushAttempted)
+            {
+                Remove-LocalReleaseStash `
+                    -ProjectContext $ProjectContext
+
+                Write-Status `
+                    -Status Success `
+                    -Message "Temporary local release stash removed"
+            }
+            else
+            {
+                Restore-LocalReleaseStash `
+                    -ProjectContext $ProjectContext
+            }
+        }
         $ProjectContext.ProjectFolder = $ProjectContext.OriginalProjectFolder
         $ProjectContext.TransactionActive = $false
     }
@@ -1619,7 +1815,8 @@ function Get-TargetVersion
         -Value $ProjectContext.CurrentVersion `
         -Description "Current version"
 
-    if ($ProjectContext.IsNewProject)
+    if ($ProjectContext.IsNewProject -and
+        $ProjectContext.SourceMode -ne "Zip")
     {
         $ProjectContext.TargetVersion = $ProjectContext.InitialVersion
         $ProjectContext.ReleaseType = $BootstrapDefaults.ReleaseType
@@ -1674,7 +1871,8 @@ function Get-TargetVersion
             -Value $NormalisedZipVersion `
             -Description "Change Package version"
 
-        if ($PackageVersion -le $Current)
+        if (-not $ProjectContext.IsNewProject -and
+            $PackageVersion -le $Current)
         {
             Stop-ProjectRelease (
                 "Change Package version $NormalisedZipVersion must be greater " +
@@ -1683,7 +1881,20 @@ function Get-TargetVersion
         }
 
         $ProjectContext.TargetVersion = $PackageVersion.ToString()
-        $ProjectContext.ReleaseType = "Package"
+        $ProjectContext.ReleaseType =
+            if ($ProjectContext.IsNewProject)
+            {
+                $BootstrapDefaults.ReleaseType
+            }
+            else
+            {
+                "Package"
+            }
+
+        if ($ProjectContext.IsNewProject)
+        {
+            $ProjectContext.ReleaseHistoryNote = $BootstrapDefaults.ReleaseNotes
+        }
     }
     else
     {
@@ -2621,7 +2832,17 @@ function Initialize-ChangeSource
 
         "Zip"
         {
-            if ($ProjectContext.InitialGitChanges.Count -gt 0)
+            $BootstrapGitChanges = @(
+                $ProjectContext.CreatedFiles |
+                ForEach-Object { "?? $_" }
+            )
+
+            $UnexpectedGitChanges = @(
+                $ProjectContext.InitialGitChanges |
+                Where-Object { $BootstrapGitChanges -notcontains $_ }
+            )
+
+            if ($UnexpectedGitChanges.Count -gt 0)
             {
                 Stop-ProjectRelease `
                     "The Git working tree must be clean before importing a Change Package."
