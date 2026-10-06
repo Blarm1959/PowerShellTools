@@ -39,6 +39,7 @@
 #>
 
 # Version History
+# 2.7.5 - Added per-project opt-out of automatic <Repo>-App publication.
 # 2.7.4 - Fixed new-project identity inside transactional worktrees.
 # 2.7.3 - Fixed -Local transactional releases and first -Zip releases for new projects.
 # 2.7.0 - Automatic publication of app files to a public <Repo>-App repository.
@@ -76,7 +77,7 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.7.4"
+$ScriptVersion = "2.7.5"
 $BootstrapDefaults = [ordered]@{
     Version          = "0.0.1"
     ReleaseType      = "Initial"
@@ -3592,6 +3593,25 @@ function Publish-AppRepository
     $ErrorActionPreference = "Continue"
 
     if ($ProjectContext.NoBump) { return }
+
+    # Some projects use <Repo>-App as an independent application repository
+    # rather than as an automatically mirrored publication target.
+    #
+    # A tracked .pstp-no-app-publish marker in the source project disables
+    # automatic App-repository publication while leaving the normal source
+    # release completely unchanged.
+    $DisableAppPublishMarker = Join-Path `
+        -Path $ProjectContext.OriginalProjectFolder `
+        -ChildPath ".pstp-no-app-publish"
+
+    if (Test-Path -LiteralPath $DisableAppPublishMarker -PathType Leaf)
+    {
+        $ProjectContext.AppStatus = "Disabled by .pstp-no-app-publish"
+        Write-Status `
+            -Status Success `
+            -Message "Automatic App repository publication disabled for this project."
+        return
+    }
 
     try
     {
