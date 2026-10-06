@@ -39,6 +39,7 @@
 #>
 
 # Version History
+# 2.7.6 - Added controlled Change Package adoption and deletion manifest support.
 # 2.7.5 - Added per-project opt-out of automatic <Repo>-App publication.
 # 2.7.4 - Fixed new-project identity inside transactional worktrees.
 # 2.7.3 - Fixed -Local transactional releases and first -Zip releases for new projects.
@@ -77,7 +78,7 @@ param
 #region Configuration
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2.7.5"
+$ScriptVersion = "2.7.6"
 $BootstrapDefaults = [ordered]@{
     Version          = "0.0.1"
     ReleaseType      = "Initial"
@@ -88,6 +89,7 @@ $BootstrapDefaults = [ordered]@{
 }
 
 $MaximumHistoryEntries = $BootstrapDefaults.HistoryEntries
+$ChangePackageManifestName = ".pstp-change-package.json"
 
 $ReleaseManagedZipFiles = @(
     "release.json"
@@ -122,6 +124,8 @@ $ProjectContext = [PSCustomObject]@{
     DownloadsFolder     = $null
     ImportedFiles       = @()
     IgnoredFiles        = @()
+    DeletedPaths        = @()
+    PackageAdoptionRequested = $false
     InitialGitChanges   = @()
     CommitMessage       = $null
     ReleaseHistoryNote  = $null
@@ -1768,6 +1772,58 @@ function Refresh-ImportedProjectContent
         return
     }
 
+    $Imported = @($ProjectContext.ImportedFiles)
+
+    if ($Imported -contains "release.json")
+    {
+        $ReleasePath = Join-Path $ProjectContext.ProjectFolder "release.json"
+        $ProjectContext.Release =
+            Read-JsonFile -Path $ReleasePath -DisplayName "release.json"
+
+        $ImportedProjectName = [string]$ProjectContext.Release.project
+        $ImportedVersion = [string]$ProjectContext.Release.version
+
+        if ([string]::IsNullOrWhiteSpace($ImportedProjectName))
+        {
+            Stop-ProjectRelease "Imported release.json does not contain a project name."
+        }
+
+        [void](Test-SemanticVersion -Value $ImportedVersion -Description "Imported current version")
+
+        if ($ProjectContext.PackageAdoptionRequested)
+        {
+            $FolderProjectName = Split-Path `
+                -Path $ProjectContext.OriginalProjectFolder `
+                -Leaf
+
+            if ($ImportedProjectName -ne $FolderProjectName)
+            {
+                Stop-ProjectRelease (
+                    "Adopted release.json project '$ImportedProjectName' must match " +
+                    "the repository folder name '$FolderProjectName'."
+                )
+            }
+        }
+
+        $ProjectContext.ProjectName = $ImportedProjectName
+        $ProjectContext.CurrentVersion = $ImportedVersion
+
+        Write-Status `
+            -Status Success `
+            -Message "Imported release.json reloaded"
+    }
+
+    if ($Imported -contains "build-info.json")
+    {
+        $BuildInfoPath = Join-Path $ProjectContext.ProjectFolder "build-info.json"
+        $ProjectContext.BuildInfo =
+            Read-JsonFile -Path $BuildInfoPath -DisplayName "build-info.json"
+
+        Write-Status `
+            -Status Success `
+            -Message "Imported build-info.json reloaded"
+    }
+
     $PackagePath = Join-Path $ProjectContext.ProjectFolder "package.json"
     $ProjectContext.HasPackageJson = Test-Path -LiteralPath $PackagePath -PathType Leaf
 
@@ -1776,10 +1832,13 @@ function Refresh-ImportedProjectContent
         $ProjectContext.Package =
             Read-JsonFile -Path $PackagePath -DisplayName "package.json"
     }
+    else
+    {
+        $ProjectContext.Package = $null
+    }
 
     Write-Status -Status Success -Message "Imported project metadata reloaded"
 }
-
 function Get-TargetVersion
 {
     [CmdletBinding()]
@@ -2512,23 +2571,46 @@ function Get-LatestChangePackage
     $ProjectContext.DownloadsFolder =
         Get-WindowsDownloadsFolder
 
-    $Pattern =
-        "$($ProjectContext.ProjectName)-Changes*.zip"
+    $FolderProjectName = Split-Path `
+        -Path $ProjectContext.OriginalProjectFolder `
+        -Leaf
 
-    $Packages = @(
-        Get-ChildItem `
-            -LiteralPath $ProjectContext.DownloadsFolder `
-            -Filter $Pattern `
-            -File |
-        Sort-Object `
-            -Property LastWriteTime, Name `
-            -Descending
-    )
+    $Names = @($FolderProjectName)
+
+    if (-not [string]::IsNullOrWhiteSpace($ProjectContext.ProjectName) -and
+        $ProjectContext.ProjectName -ne $FolderProjectName)
+    {
+        $Names += $ProjectContext.ProjectName
+    }
+
+    $Packages = @()
+
+    foreach ($Name in $Names)
+    {
+        $Pattern = "$Name-Changes*.zip"
+
+        $Packages = @(
+            Get-ChildItem `
+                -LiteralPath $ProjectContext.DownloadsFolder `
+                -Filter $Pattern `
+                -File |
+            Sort-Object `
+                -Property LastWriteTime, Name `
+                -Descending
+        )
+
+        if ($Packages.Count -gt 0)
+        {
+            break
+        }
+    }
 
     if ($Packages.Count -eq 0)
     {
-        Stop-ProjectRelease `
-            "No '$Pattern' file was found in $($ProjectContext.DownloadsFolder)"
+        Stop-ProjectRelease (
+            "No Change Package was found in $($ProjectContext.DownloadsFolder). " +
+            "Expected '$FolderProjectName-Changes*.zip'."
+        )
     }
 
     $ProjectContext.SourceZip = $Packages[0]
@@ -2537,7 +2619,6 @@ function Get-LatestChangePackage
         -Status Success `
         -Message "Change Package found: $($ProjectContext.SourceZip.Name)"
 }
-
 function Test-ZipEntryPath
 {
     [CmdletBinding()]
@@ -2683,6 +2764,77 @@ function Import-ChangePackage
             -ExtractedFolder $TemporaryFolder `
             -ProjectName $ProjectContext.ProjectName
 
+        $ManifestPath = Join-Path $PackageRoot $ChangePackageManifestName
+        $AllowedManagedFiles = @()
+        $DeletePaths = @()
+
+        if (Test-Path -LiteralPath $ManifestPath -PathType Leaf)
+        {
+            try
+            {
+                $Manifest = Get-Content -LiteralPath $ManifestPath -Raw |
+                    ConvertFrom-Json -ErrorAction Stop
+            }
+            catch
+            {
+                throw "$ChangePackageManifestName contains invalid JSON."
+            }
+
+            if ([int]$Manifest.schemaVersion -ne 1)
+            {
+                throw "$ChangePackageManifestName schemaVersion must be 1."
+            }
+
+            $ProjectContext.PackageAdoptionRequested =
+                ($Manifest.PSObject.Properties.Name -contains "adoptProject" -and
+                 [bool]$Manifest.adoptProject)
+
+            if ($Manifest.PSObject.Properties.Name -contains "allowManagedFiles")
+            {
+                $AllowedManagedFiles = @(
+                    $Manifest.allowManagedFiles |
+                    ForEach-Object {
+                        ([string]$_).Replace("\\", "/").TrimStart("/")
+                    }
+                )
+
+                foreach ($ManagedFile in $AllowedManagedFiles)
+                {
+                    if ($ManagedFile -notin $ReleaseManagedZipFiles)
+                    {
+                        throw (
+                            "$ChangePackageManifestName may only allow known release-managed " +
+                            "files: $($ReleaseManagedZipFiles -join ', '). Invalid: $ManagedFile"
+                        )
+                    }
+                }
+            }
+
+            if ($AllowedManagedFiles -contains "release.json" -and
+                -not $ProjectContext.PackageAdoptionRequested)
+            {
+                throw (
+                    "$ChangePackageManifestName must set adoptProject to true " +
+                    "when importing release.json."
+                )
+            }
+
+            if ($Manifest.PSObject.Properties.Name -contains "delete")
+            {
+                $DeletePaths = @(
+                    $Manifest.delete |
+                    ForEach-Object {
+                        ([string]$_).Replace("\\", "/").Trim("/")
+                    } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                )
+            }
+
+            Write-Status `
+                -Status Success `
+                -Message "Change Package manifest loaded"
+        }
+
         $Files = @(
             Get-ChildItem `
                 -LiteralPath $PackageRoot `
@@ -2699,15 +2851,28 @@ function Import-ChangePackage
 
         $ImportedFiles = [System.Collections.Generic.List[string]]::new()
         $IgnoredFiles = [System.Collections.Generic.List[string]]::new()
+        $DeletedPaths = [System.Collections.Generic.List[string]]::new()
 
         foreach ($File in $Files)
         {
             $RelativePath = $File.FullName.Substring(
                 $PackageRoot.Length
-            ).TrimStart("\", "/")
+            ).TrimStart("\\", "/")
 
-            if (Test-IgnoredChangePackagePath `
-                -RelativePath $RelativePath)
+            $NormalisedRelativePath =
+                $RelativePath.Replace("\\", "/").TrimStart("/")
+
+            if ($NormalisedRelativePath -eq $ChangePackageManifestName)
+            {
+                continue
+            }
+
+            $IsManagedOverride =
+                $AllowedManagedFiles -contains $NormalisedRelativePath
+
+            if ((Test-IgnoredChangePackagePath `
+                -RelativePath $NormalisedRelativePath) -and
+                -not $IsManagedOverride)
             {
                 $IgnoredFiles.Add($RelativePath)
                 continue
@@ -2745,8 +2910,63 @@ function Import-ChangePackage
             $ImportedFiles.Add($RelativePath)
         }
 
+        foreach ($DeletePath in $DeletePaths)
+        {
+            Test-ZipEntryPath -EntryPath $DeletePath
+
+            $NormalisedDelete = $DeletePath.Replace("\\", "/").Trim("/")
+
+            if ($NormalisedDelete -in @(
+                ".git",
+                $ChangePackageManifestName,
+                "PSTP.ps1",
+                "release.json",
+                "build-info.json"
+            ))
+            {
+                throw "Unsafe or release-critical delete path in Change Package: $DeletePath"
+            }
+
+            foreach ($ImportedFile in $ImportedFiles)
+            {
+                $ImportedNormalised =
+                    $ImportedFile.Replace("\\", "/").TrimStart("/")
+
+                if ($ImportedNormalised -eq $NormalisedDelete -or
+                    $ImportedNormalised.StartsWith($NormalisedDelete + "/"))
+                {
+                    throw (
+                        "Change Package cannot import and delete the same path: " +
+                        "$NormalisedDelete"
+                    )
+                }
+            }
+
+            $DeleteTarget = Join-Path `
+                -Path $ProjectContext.ProjectFolder `
+                -ChildPath $NormalisedDelete
+
+            if ($ProjectContext.DryRun)
+            {
+                $DeletedPaths.Add($NormalisedDelete)
+                continue
+            }
+
+            if (Test-Path -LiteralPath $DeleteTarget)
+            {
+                Remove-Item `
+                    -LiteralPath $DeleteTarget `
+                    -Recurse `
+                    -Force `
+                    -ErrorAction Stop
+
+                $DeletedPaths.Add($NormalisedDelete)
+            }
+        }
+
         $ProjectContext.ImportedFiles = @($ImportedFiles)
         $ProjectContext.IgnoredFiles = @($IgnoredFiles)
+        $ProjectContext.DeletedPaths = @($DeletedPaths)
 
         foreach ($IgnoredFile in $ProjectContext.IgnoredFiles)
         {
@@ -2755,20 +2975,26 @@ function Import-ChangePackage
                 -Message "Ignored release-managed file: $IgnoredFile"
         }
 
-        if ($ProjectContext.ImportedFiles.Count -eq 0)
+        if ($ProjectContext.ImportedFiles.Count -eq 0 -and
+            $ProjectContext.DeletedPaths.Count -eq 0)
         {
-            throw "The Change Package contained no importable changed files."
+            throw "The Change Package contained no importable changes."
         }
 
         if ($ProjectContext.DryRun)
         {
             Write-Status `
                 -Status Warning `
-                -Message "Dry run: Change Package files were not copied."
+                -Message "Dry run: Change Package changes were not applied."
 
             foreach ($ImportedFile in $ProjectContext.ImportedFiles)
             {
                 Write-Host "       Would import: $ImportedFile"
+            }
+
+            foreach ($DeletedPath in $ProjectContext.DeletedPaths)
+            {
+                Write-Host "       Would delete: $DeletedPath"
             }
         }
         else
@@ -2778,6 +3004,13 @@ function Import-ChangePackage
                 Write-Status `
                     -Status Success `
                     -Message "Imported: $ImportedFile"
+            }
+
+            foreach ($DeletedPath in $ProjectContext.DeletedPaths)
+            {
+                Write-Status `
+                    -Status Success `
+                    -Message "Deleted: $DeletedPath"
             }
         }
     }
@@ -2797,7 +3030,6 @@ function Import-ChangePackage
         }
     }
 }
-
 function Initialize-ChangeSource
 {
     [CmdletBinding()]
@@ -3094,7 +3326,7 @@ function Set-ReleaseFiles
             -Path $ProjectContext.ProjectFolder `
             -ChildPath "service-worker.js"
 
-        if (Test-Path -LiteralPath $ServiceWorkerPath -PathType Leaf)
+         if (Test-Path -LiteralPath ServiceWorkerPath -PathType Leaf)
         {
             Write-Host "       Would synchronise: service-worker.js"
         }
@@ -3103,7 +3335,7 @@ function Set-ReleaseFiles
             -Path $ProjectContext.ProjectFolder `
             -ChildPath "manifest.json"
 
-        if (Test-Path -LiteralPath $ManifestPath -PathType Leaf)
+         if (Test-Path -LiteralPath ManifestPath -PathType Leaf)
         {
             Write-Host "       Would synchronise: manifest.json"
         }
@@ -3255,7 +3487,7 @@ function Ensure-GitIgnoreEntry
 
     $Lines = @()
 
-    if (Test-Path -LiteralPath $GitIgnorePath -PathType Leaf)
+    if ((Test-Path -LiteralPath GitIgnorePath -PathType Leaf)
     {
         $Lines = @(Get-Content -LiteralPath $GitIgnorePath)
     }
@@ -3382,7 +3614,7 @@ function Publish-ProjectRelease
         Write-Status -Status Progress -Message $PreparationMessage
 
         $GitIgnorePath = Join-Path -Path $ProjectContext.ProjectFolder -ChildPath ".gitignore"
-        Ensure-GitIgnoreEntry -GitIgnorePath $GitIgnorePath -Entry ".vs/"
+        Ensure-GitIgnoreEntry -GitIgnorelPath GitIgnorePath -Entry ".vs/"
 
         Invoke-NativeCommand -Command "git.exe" -Arguments @(
             "rm", "-r", "--cached", "--ignore-unmatch", ".vs"
@@ -3551,8 +3783,8 @@ function Test-AppFileIncluded
         [string[]]$ExtraExcludes
     )
 
-    if (Test-AppPathMatch -RelativePath $RelativePath -Patterns $ExtraExcludes) { return $false }
-    if (Test-AppPathMatch -RelativePath $RelativePath -Patterns $ExtraIncludes) { return $true }
+    if ((TestAppPathMatch -RelativePath $RelativePath -Patterns $ExtraExcludes) { return $false }
+    if ((TestAppPathMatch -RelativePath $RelativePath -Patterns $ExtraIncludes) { return $true }
 
     $FirstSegment = ($RelativePath -split "/")[0]
     if (($RelativePath -split "/").Count -gt 1 -and
@@ -3561,7 +3793,7 @@ function Test-AppFileIncluded
         return $false
     }
 
-    if (Test-AppPathMatch -RelativePath $RelativePath -Patterns $AppDefaultExcludedPatterns) { return $false }
+    if ((TestAppPathMatch -RelativePath $RelativePath -Patterns $AppDefaultExcludedPatterns) { return $false }
 
     return $true
 }
@@ -3710,8 +3942,8 @@ function Publish-AppRepository
             $SourceFiles |
             Where-Object {
                 -not [string]::IsNullOrWhiteSpace($_) -and
-                (Test-AppFileIncluded -RelativePath $_ -ExtraIncludes $Includes -ExtraExcludes $Excludes) -and
-                -not (Test-AppPathMatch -RelativePath $_ -Patterns $AppProtectedPatterns)
+                ((TestAppFileIncluded -RelativePath $_ -ExtraIncludes $Includes -ExtraExcludes $Excludes) -and
+                -not ((TestAppPathMatch -RelativePath $_ -Patterns $AppProtectedPatterns)
             }
         )
 
@@ -3727,7 +3959,7 @@ function Publish-AppRepository
         {
             if ([string]::IsNullOrWhiteSpace($File)) { continue }
             if ($AppFileSet.Contains($File)) { continue }
-            if (Test-AppPathMatch -RelativePath $File -Patterns $AppProtectedPatterns) { continue }
+            if ((TestAppPathMatch -RelativePath $File -Patterns $AppProtectedPatterns) { continue }
 
             $Target = Join-Path $AppFolder ($File.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
             if (Test-Path -LiteralPath $Target) { Remove-Item -LiteralPath $Target -Force -ErrorAction Stop }
@@ -3746,7 +3978,7 @@ function Publish-AppRepository
                 [void](New-Item -ItemType Directory -Path $TargetDir -Force -ErrorAction Stop)
             }
 
-            Copy-Item -LiteralPath $Source -Destination $Target -Force -ErrorAction Stop
+            Copy-Item  -LiteralPath Source -Destination $Target -Force -ErrorAction Stop
         }
 
         $NoJekyll = Join-Path $AppFolder ".nojekyll"
