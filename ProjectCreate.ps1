@@ -31,7 +31,7 @@
 # After a successful bootstrap push, ProjectCreate changes into
 # the new project folder and runs:
 #
-#   .\PSTP.ps1 Release
+#   .\PSTP.ps1 Release -Version 1.0.1
 #
 # ProjectRelease is responsible for the initial and all
 # subsequent project metadata, versioning, commits, releases
@@ -366,7 +366,7 @@ if (-not (Test-Path -LiteralPath $pstpFile -PathType Leaf)) {
 
 Set-Location -LiteralPath $projectFolder
 
-& $pstpFile Release
+& $pstpFile Release -Version "1.0.1"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
