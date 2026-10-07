@@ -1,8 +1,9 @@
-# ============================================================
+﻿# ============================================================
 # Blarm Generic Project Creator
 #
 # Bootstraps a newly created/cloned project with the standard
-# files defined in ProjectCreate.json.
+# files defined in ProjectCreate.json, then commits and pushes
+# the bootstrap changes to GitHub.
 #
 # Usage:
 #   .\ProjectCreate.ps1 <ProjectName>
@@ -23,6 +24,9 @@
 #
 # ProjectCreate.json contains the list of files to copy from
 # the PowerShellTools root into the new project.
+#
+# ProjectCreate commits its bootstrap changes as "ProjectCreate"
+# and pushes them to the project's origin remote.
 #
 # ProjectRelease is responsible for all subsequent project
 # metadata, versioning, commits, releases and Git operations.
@@ -116,6 +120,55 @@ if (-not (Test-Path -LiteralPath $projectFolder -PathType Container)) {
 Write-Host "[ OK ] Project folder: $projectFolder"
 
 # ------------------------------------------------------------
+# Validate Git repository and clean working tree
+# ------------------------------------------------------------
+
+Write-Host "[....] Validating Git repository"
+
+$insideWorkTree = & git -C $projectFolder rev-parse --is-inside-work-tree 2>&1
+
+if ($LASTEXITCODE -ne 0 -or "$insideWorkTree".Trim() -ne "true") {
+    Write-Host "[ERROR] Project folder is not a Git repository:" -ForegroundColor Red
+    Write-Host "        $projectFolder"
+    Write-Host ""
+    Write-Host "Create/clone the GitHub repository first, then run ProjectCreate."
+    exit 1
+}
+
+Write-Host "[ OK ] Git repository found"
+
+$existingChanges = @(& git -C $projectFolder status --porcelain 2>&1)
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Unable to read Git working-tree status." -ForegroundColor Red
+    $existingChanges | ForEach-Object { Write-Host "        $_" }
+    exit 1
+}
+
+if ($existingChanges.Count -gt 0) {
+    Write-Host "[ERROR] The target repository already contains uncommitted changes." -ForegroundColor Red
+    Write-Host ""
+    $existingChanges | ForEach-Object { Write-Host "        $_" }
+    Write-Host ""
+    Write-Host "Commit, discard or otherwise resolve these changes before running ProjectCreate."
+    Write-Host "This prevents ProjectCreate from accidentally including unrelated work."
+    exit 1
+}
+
+Write-Host "[ OK ] Working tree clean"
+
+$originUrl = & git -C $projectFolder remote get-url origin 2>&1
+
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$originUrl")) {
+    Write-Host "[ERROR] Git remote 'origin' is not configured." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "ProjectCreate requires the repository to have been cloned from GitHub."
+    exit 1
+}
+
+Write-Host "[ OK ] Git remote: origin"
+
+# ------------------------------------------------------------
 # Validate all source files before copying anything
 # ------------------------------------------------------------
 
@@ -186,6 +239,110 @@ foreach ($file in $filesToCopy) {
 
     Write-Host "[ OK ] Created: $($file.RelativeFile)"
 }
+
+# ------------------------------------------------------------
+# Stage ProjectCreate files only
+# ------------------------------------------------------------
+
+Write-Host "[....] Staging ProjectCreate files"
+
+foreach ($file in $filesToCopy) {
+    & git -C $projectFolder add -- $file.RelativeFile
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[ERROR] Failed to stage:" -ForegroundColor Red
+        Write-Host "        $($file.RelativeFile)"
+        exit 1
+    }
+}
+
+$stagedChanges = @(& git -C $projectFolder diff --cached --name-only 2>&1)
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Unable to inspect staged ProjectCreate changes." -ForegroundColor Red
+    $stagedChanges | ForEach-Object { Write-Host "        $_" }
+    exit 1
+}
+
+if ($stagedChanges.Count -eq 0) {
+    Write-Host "[ OK ] Repository already contains the current ProjectCreate files"
+    Write-Host ""
+    Write-Host "Project bootstrap complete." -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Next:"
+    Write-Host "  cd `"$projectFolder`""
+    Write-Host "  .\PSTP.ps1 Release"
+    Write-Host ""
+    exit 0
+}
+
+$unexpectedStaged = @(
+    $stagedChanges | Where-Object {
+        $_ -notin $filesToCopy.RelativeFile
+    }
+)
+
+if ($unexpectedStaged.Count -gt 0) {
+    Write-Host "[ERROR] Unexpected staged files were detected:" -ForegroundColor Red
+    $unexpectedStaged | ForEach-Object { Write-Host "        $_" }
+    Write-Host ""
+    Write-Host "ProjectCreate will not create a commit containing unrelated files."
+    exit 1
+}
+
+$stagedChanges | ForEach-Object {
+    Write-Host "[ OK ] Staged: $_"
+}
+
+# ------------------------------------------------------------
+# Commit bootstrap
+# ------------------------------------------------------------
+
+Write-Host "[....] Committing ProjectCreate changes"
+
+$commitOutput = @(& git -C $projectFolder commit -m "ProjectCreate" 2>&1)
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Git commit failed." -ForegroundColor Red
+    $commitOutput | ForEach-Object { Write-Host "        $_" }
+    exit 1
+}
+
+Write-Host "[ OK ] Commit created: ProjectCreate"
+
+# ------------------------------------------------------------
+# Push bootstrap to GitHub
+# ------------------------------------------------------------
+
+Write-Host "[....] Pushing ProjectCreate changes to GitHub"
+
+$branch = (& git -C $projectFolder branch --show-current 2>&1).Trim()
+
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($branch)) {
+    Write-Host "[ERROR] Unable to determine the current Git branch." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "The ProjectCreate commit has been created locally but was not pushed."
+    exit 1
+}
+
+$upstream = & git -C $projectFolder rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null
+
+if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace("$upstream")) {
+    $pushOutput = @(& git -C $projectFolder push 2>&1)
+}
+else {
+    $pushOutput = @(& git -C $projectFolder push -u origin $branch 2>&1)
+}
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Git push failed." -ForegroundColor Red
+    $pushOutput | ForEach-Object { Write-Host "        $_" }
+    Write-Host ""
+    Write-Host "The ProjectCreate commit exists locally and can be pushed manually."
+    exit 1
+}
+
+Write-Host "[ OK ] ProjectCreate changes published to GitHub"
 
 # ------------------------------------------------------------
 # Complete
