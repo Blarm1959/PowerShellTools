@@ -1,9 +1,9 @@
-﻿# ============================================================
+﻿﻿# ============================================================
 # Blarm Generic Project Creator
 #
 # Bootstraps a newly created/cloned project with the standard
-# files defined in ProjectCreate.json, then commits and pushes
-# the bootstrap changes to GitHub.
+# files defined in ProjectCreate.json, commits and pushes the
+# bootstrap changes to GitHub, then runs the initial PSTP release.
 #
 # Usage:
 #   .\ProjectCreate.ps1 <ProjectName>
@@ -28,8 +28,14 @@
 # ProjectCreate commits its bootstrap changes as "ProjectCreate"
 # and pushes them to the project's origin remote.
 #
-# ProjectRelease is responsible for all subsequent project
-# metadata, versioning, commits, releases and Git operations.
+# After a successful bootstrap push, ProjectCreate changes into
+# the new project folder and runs:
+#
+#   .\PSTP.ps1 Release
+#
+# ProjectRelease is responsible for the initial and all
+# subsequent project metadata, versioning, commits, releases
+# and Git operations.
 # ============================================================
 
 param(
@@ -267,11 +273,7 @@ if ($LASTEXITCODE -ne 0) {
 if ($stagedChanges.Count -eq 0) {
     Write-Host "[ OK ] Repository already contains the current ProjectCreate files"
     Write-Host ""
-    Write-Host "Project bootstrap complete." -ForegroundColor Green
-    Write-Host ""
-    Write-Host "Next:"
-    Write-Host "  cd `"$projectFolder`""
-    Write-Host "  .\PSTP.ps1 Release"
+    Write-Host "Project bootstrap already present; no commit or initial release created." -ForegroundColor Yellow
     Write-Host ""
     exit 0
 }
@@ -345,15 +347,46 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "[ OK ] ProjectCreate changes published to GitHub"
 
 # ------------------------------------------------------------
+# Run initial PSTP release
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[....] Starting initial PSTP release"
+
+$pstpFile = Join-Path $projectFolder "PSTP.ps1"
+
+if (-not (Test-Path -LiteralPath $pstpFile -PathType Leaf)) {
+    Write-Host "[ERROR] PSTP.ps1 was not found after ProjectCreate:" -ForegroundColor Red
+    Write-Host "        $pstpFile"
+    Write-Host ""
+    Write-Host "The ProjectCreate bootstrap was committed and pushed successfully,"
+    Write-Host "but the initial PSTP release could not be started."
+    exit 1
+}
+
+Set-Location -LiteralPath $projectFolder
+
+& $pstpFile Release
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "[ERROR] Initial PSTP release failed." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "ProjectCreate itself completed and was pushed successfully."
+    Write-Host "You are now in:"
+    Write-Host "        $projectFolder"
+    exit $LASTEXITCODE
+}
+
+# ------------------------------------------------------------
 # Complete
 # ------------------------------------------------------------
 
 Write-Host ""
-Write-Host "Project bootstrap complete." -ForegroundColor Green
+Write-Host "Project bootstrap and initial release complete." -ForegroundColor Green
 Write-Host ""
-Write-Host "Next:"
-Write-Host "  cd `"$projectFolder`""
-Write-Host "  .\PSTP.ps1 Release"
+Write-Host "Current folder:"
+Write-Host "  $projectFolder"
 Write-Host ""
 
 exit 0
