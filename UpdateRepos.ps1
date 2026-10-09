@@ -17,8 +17,16 @@
     It then shows the status of every repo: up to date, behind, ahead,
     diverged, uncommitted changes or stashes.
 
-    With the GitHub CLI (gh) logged in, missing private repos are found too;
-    without it only public repos can be checked.
+    A saved Windows-encrypted token lists public and private repository names.
+    Save it under LOCALAPPDATA\Blarm1959\UpdateRepos\github-token.txt using
+    Read-Host -AsSecureString | ConvertFrom-SecureString | Set-Content.
+    Use a fine-grained token for All repositories with Metadata read permission.
+    If no token works, an authenticated GitHub CLI (gh) is tried, then public API.
+    Clones and pulls use existing Git credentials, never the metadata-only token.
+    Failed clones remain listed for manual action.
+    Also reports duplicate clones, unmatched origins, different folder names
+    and folders without Git metadata. Excluded copies are audited too.
+    No folders are deleted or renamed. An incomplete inventory exits with 1.
 
     With -L nothing is changed apart from the fetch: it only lists the repos
     and their status, and the missing repos with their clone commands.
@@ -58,7 +66,7 @@ param(
     [switch]$NoFetch
 )
 
-$ScriptVersion = '1.0.0'   # 1.0.0 - replaces CheckRepos.ps1: updates by default, -L lists only
+$ScriptVersion = '1.2.0'   # Encrypted token inventory; automatic clones use existing Git credentials.
 
 $U = -not $L
 
@@ -148,7 +156,8 @@ function Get-RepoState {
 # Check (and optionally update) each repo
 # ------------------------------------------------------------
 
-$allFolders = @(Get-ChildItem -LiteralPath $Root -Directory |
+$rootFolders = @(Get-ChildItem -LiteralPath $Root -Directory | Sort-Object Name)
+$allFolders = @($rootFolders |
     Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName '.git') } |
     Sort-Object Name)
 
@@ -245,22 +254,123 @@ foreach ($f in $allFolders) {
 
 $remoteNames = $null
 $scope = ''
-
-if (Get-Command gh -ErrorAction SilentlyContinue) {
-    $remoteNames = @(gh repo list $Owner --limit 500 --json name -q '.[].name' 2>$null)
-    if ($LASTEXITCODE -ne 0) { $remoteNames = $null } else { $scope = 'all' }
+$inventoryWarning = ''
+$tokenPath = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Blarm1959\UpdateRepos\github-token.txt' } else { '' }
+if ($tokenPath -and (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
+    $tokenHeaders = $null
+    $plainToken = $null
+    $secureToken = $null
+    try {
+        $secureToken = (Get-Content -LiteralPath $tokenPath -Raw -ErrorAction Stop).Trim() | ConvertTo-SecureString -ErrorAction Stop
+        $credential = [System.Management.Automation.PSCredential]::new('UpdateRepos', $secureToken)
+        $plainToken = $credential.GetNetworkCredential().Password
+        $tokenHeaders = @{ Authorization = "Bearer $plainToken"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'UpdateRepos' }
+        $identity = Invoke-RestMethod -Uri 'https://api.github.com/user' -Headers $tokenHeaders -ErrorAction Stop
+        if ($identity.login -ine $Owner) { throw 'Token owner does not match the requested owner.' }
+        $tokenNames = @()
+        $page = 1
+        do {
+            $api = @(Invoke-RestMethod -Uri "https://api.github.com/user/repos?affiliation=owner&visibility=all&per_page=100&page=$page" -Headers $tokenHeaders -ErrorAction Stop)
+            $tokenNames += @($api | Where-Object { $_.owner.login -ieq $Owner } | ForEach-Object { $_.name })
+            $page++
+        } while ($api.Count -eq 100)
+        $remoteNames = $tokenNames
+        $scope = 'all'
+    }
+    catch {
+        # Never print API request details or credential-bearing exceptions.
+        $inventoryWarning = 'Saved token could not list repositories. Check its expiry, owner and All repositories access; private coverage is incomplete.'
+    }
+    finally {
+        if ($tokenHeaders) { $tokenHeaders.Clear() }
+        $plainToken = $null
+        $credential = $null
+        if ($secureToken) { $secureToken.Dispose() }
+    }
+}
+if ($null -eq $remoteNames -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+    $login = @(gh api user --jq .login 2>$null)
+    if ($LASTEXITCODE -eq 0) {
+        $repoJson = @(gh repo list $Owner --limit 10000 --json name 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            try {
+                $listed = @((($repoJson -join "`n") | ConvertFrom-Json -ErrorAction Stop))
+                if ($listed.Count -ge 10000) { throw 'Inventory limit reached.' }
+                $remoteNames = @($listed | ForEach-Object { $_.name })
+                if (($login -join '').Trim() -ieq $Owner) { $scope = 'all' }
+                else {
+                    $scope = 'accessible'
+                    $inventoryWarning = "gh is signed in as $($login -join ''), not $Owner; private coverage may be incomplete."
+                }
+            }
+            catch { $inventoryWarning = 'Authenticated repository inventory could not be read.' }
+        }
+        else { $inventoryWarning = 'Authenticated repository inventory failed.' }
+    }
+    else { $inventoryWarning = 'gh is not signed in. Run gh auth login to check private repos.' }
+}
+elseif ($null -eq $remoteNames -and -not $inventoryWarning) {
+    $inventoryWarning = 'No saved token or GitHub CLI login available; private coverage is incomplete.'
 }
 
 if ($null -eq $remoteNames) {
     try {
-        $api = Invoke-RestMethod -Uri "https://api.github.com/users/$Owner/repos?per_page=100" -UseBasicParsing -ErrorAction Stop
-        $remoteNames = @($api | ForEach-Object { $_.name })
+        $publicNames = @()
+        $page = 1
+        do {
+            $api = @(Invoke-RestMethod -Uri "https://api.github.com/users/$Owner/repos?per_page=100&page=$page" -ErrorAction Stop)
+            $publicNames += @($api | ForEach-Object { $_.name })
+            $page++
+        } while ($api.Count -eq 100)
+        $remoteNames = $publicNames
         $scope = 'public'
     }
     catch {
         $remoteNames = $null
+        $inventoryWarning = 'Could not retrieve a complete GitHub repository inventory.'
     }
 }
+
+# Check excluded copies too. Match by origin, not folder name.
+$inventory = @()
+foreach ($f in $allFolders) {
+    $url = git -C $f.FullName remote get-url origin 2>$null
+    $g = Get-GitHubName $url
+    $inventory += [pscustomobject]@{
+        Folder = $f.Name
+        Origin = "$url"
+        Owner = if ($g) { $g.Owner } else { '' }
+        Remote = if ($g) { $g.Name } else { '' }
+    }
+}
+$inventoryIssues = @()
+foreach ($item in $inventory) {
+    $reason = ''
+    if (-not $item.Origin) { $reason = 'No origin remote' }
+    elseif (-not $item.Remote) { $reason = 'Origin is not a recognised GitHub URL' }
+    elseif ($item.Owner -ine $Owner) { $reason = "Origin belongs to $($item.Owner), not $Owner" }
+    elseif ($null -ne $remoteNames -and $remoteNames -notcontains $item.Remote) {
+        if ($scope -eq 'all') {
+            $reason = "Origin not listed in authenticated $Owner inventory; check rename or access"
+        }
+        else { $reason = 'Origin not listed; private repository existence is unverified' }
+    }
+    if ($reason) { $inventoryIssues += [pscustomobject]@{ Folder = $item.Folder; Detail = $reason } }
+    if ($item.Remote -and $item.Owner -ieq $Owner -and $item.Folder -ine $item.Remote) {
+        $inventoryIssues += [pscustomobject]@{ Folder = $item.Folder; Detail = "Folder name differs from origin: $($item.Remote)" }
+    }
+}
+$duplicates = @($inventory | Where-Object { $_.Remote -and $_.Owner -ieq $Owner } |
+    Group-Object { "$($_.Owner)/$($_.Remote)".ToLowerInvariant() } | Where-Object { $_.Count -gt 1 })
+foreach ($group in $duplicates) {
+    $inventoryIssues += [pscustomobject]@{
+        Folder = ($group.Group.Folder -join ', ')
+        Detail = "Duplicate clones of $($group.Name)"
+    }
+}
+$nonGitFolders = @($rootFolders | Where-Object {
+    -not (Test-Path -LiteralPath (Join-Path $_.FullName '.git'))
+})
 
 $missing = @()
 $cloned  = @()
@@ -339,24 +449,47 @@ if ($null -eq $remoteNames) {
 }
 else {
     if ($scope -eq 'public') {
-        Write-Host "(gh not available: only public $Owner repos checked.)" -ForegroundColor DarkGray
+        Write-Host "(Only public $Owner repos checked; private inventory is incomplete.)" -ForegroundColor Yellow
     }
     if ($missing.Count) {
         $mWidth = ($missing | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
         Write-Host "Not cloned on this laptop ($($missing.Count)):" -ForegroundColor Yellow
         foreach ($m in $missing) {
-            Write-Host ("  {0}  git clone https://github.com/{1}/{2}.git" -f $m.PadRight($mWidth), $Owner, $m)
+            $cloneTarget = Join-Path $Root $m
+            Write-Host ("  {0}  git clone https://github.com/{1}/{2}.git {3}" -f $m.PadRight($mWidth), $Owner, $m, ('"' + $cloneTarget + '"'))
         }
         if (-not $U) { Write-Host '  (run without -L to clone them all)' -ForegroundColor DarkGray }
     }
     else {
         $label = $Owner
         if ($scope -eq 'public') { $label = "public $Owner" }
+        elseif ($scope -eq 'accessible') { $label = "accessible $Owner" }
         Write-Host "All $label repos are cloned here." -ForegroundColor Green
     }
 }
 
 Write-Host ''
 
-if ($needAction.Count -or $missing.Count) { exit 1 }
+if ($inventoryWarning) { Write-Host "[WARN] $inventoryWarning" -ForegroundColor Yellow }
+Write-Host ''
+Write-Host "Local/GitHub inventory: $($allFolders.Count) Git folders checked (including excluded folders)." -ForegroundColor Cyan
+if ($inventoryIssues.Count) {
+    Write-Host 'Local folders needing review (no folders deleted):' -ForegroundColor Yellow
+    foreach ($issue in $inventoryIssues) {
+        Write-Host ("  {0}: {1}" -f $issue.Folder, $issue.Detail) -ForegroundColor Yellow
+    }
+}
+elseif ($scope -eq 'all') {
+    Write-Host 'Every local Git folder has a matching origin; no duplicate clones or different folder names found.' -ForegroundColor Green
+}
+else {
+    Write-Host 'No additional local folder issues detected; private repository coverage is unverified.' -ForegroundColor Yellow
+}
+if ($nonGitFolders.Count) {
+    Write-Host 'Folders without Git metadata (may be ordinary folders):' -ForegroundColor Yellow
+    foreach ($folder in $nonGitFolders) { Write-Host "  $($folder.Name)" -ForegroundColor Yellow }
+}
+Write-Host ''
+if ($needAction.Count -or $missing.Count -or $inventoryIssues.Count -or $nonGitFolders.Count -or $scope -ne 'all') { exit 1 }
 exit 0
+
