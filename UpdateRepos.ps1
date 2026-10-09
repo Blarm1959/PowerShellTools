@@ -66,7 +66,7 @@ param(
     [switch]$NoFetch
 )
 
-$ScriptVersion = '1.2.0'   # Encrypted token inventory; automatic clones use existing Git credentials.
+$ScriptVersion = '1.2.1'   # Adds GitHub Desktop instructions for newly cloned repositories.
 
 $U = -not $L
 
@@ -490,6 +490,18 @@ if ($nonGitFolders.Count) {
     foreach ($folder in $nonGitFolders) { Write-Host "  $($folder.Name)" -ForegroundColor Yellow }
 }
 Write-Host ''
+if ($cloned.Count) {
+    Write-Host 'Add these newly cloned repositories to GitHub Desktop:' -ForegroundColor Cyan
+    foreach ($name in ($cloned | Sort-Object)) {
+        Write-Host ("  {0}  ({1})" -f $name, (Join-Path $Root $name))
+    }
+    Write-Host ''
+    Write-Host 'For each repository:'
+    Write-Host '  1. Choose File -> Add local repository (Ctrl+O).'
+    Write-Host "  2. Select the repository's folder shown above."
+    Write-Host '  3. Click Add repository.'
+    Write-Host ''
+}
 if ($needAction.Count -or $missing.Count -or $inventoryIssues.Count -or $nonGitFolders.Count -or $scope -ne 'all') { exit 1 }
 exit 0
 
