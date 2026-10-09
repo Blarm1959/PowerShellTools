@@ -66,7 +66,7 @@ param(
     [switch]$NoFetch
 )
 
-$ScriptVersion = '1.2.1'   # Adds GitHub Desktop instructions for newly cloned repositories.
+$ScriptVersion = '1.2.2'   # Prints optional GitHub Desktop reset instructions; never executes the reset.
 
 $U = -not $L
 
@@ -502,6 +502,16 @@ if ($cloned.Count) {
     Write-Host '  3. Click Add repository.'
     Write-Host ''
 }
+Write-Host 'Optional: reset the GitHub Desktop repository list' -ForegroundColor Cyan
+Write-Host '  Close GitHub Desktop first, then run this command yourself:'
+Write-Host '  Remove-Item "$env:APPDATA\GitHub Desktop\IndexedDB" -Recurse -Force'
+Write-Host ''
+Write-Host '  Then reopen GitHub Desktop and drag your repository folders into it.'
+Write-Host ("  Repository folders are under: {0}" -f $Root)
+Write-Host '  This clears the old local repository list without deleting your Git repositories.'
+Write-Host '  It also resets other GitHub Desktop state stored in IndexedDB.'
+Write-Host '  UpdateRepos has NOT run the reset command.'
+Write-Host ''
 if ($needAction.Count -or $missing.Count -or $inventoryIssues.Count -or $nonGitFolders.Count -or $scope -ne 'all') { exit 1 }
 exit 0
 
