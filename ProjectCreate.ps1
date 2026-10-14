@@ -1,4 +1,4 @@
-﻿﻿# ============================================================
+# ============================================================
 # Blarm Generic Project Creator
 #
 # Bootstraps a newly created/cloned project with the standard
@@ -244,6 +244,25 @@ foreach ($file in $filesToCopy) {
         -Force
 
     Write-Host "[ OK ] Created: $($file.RelativeFile)"
+}
+
+# ------------------------------------------------------------
+# Ensure the new project has a README.md (preserve existing content)
+# ------------------------------------------------------------
+
+$readmePath = Join-Path $projectFolder "README.md"
+if (-not (Test-Path -LiteralPath $readmePath -PathType Leaf)) {
+    [System.IO.File]::WriteAllText(
+        $readmePath,
+        "",
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    $filesToCopy += [PSCustomObject]@{
+        RelativeFile = "README.md"
+        SourceFile   = $null
+        TargetFile   = $readmePath
+    }
+    Write-Host "[ OK ] Created empty README.md"
 }
 
 # ------------------------------------------------------------

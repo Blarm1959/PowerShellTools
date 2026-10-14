@@ -1032,6 +1032,10 @@ function New-InitialReadmeContent
     $ProjectName = $ProjectContext.ProjectName
 
     $InitialTag = "v$($ProjectContext.InitialVersion)"
+    if ($null -eq $Readme) {
+        $Readme = ""
+    }
+
     $BeginMarker = "<!-- PROJECTRELEASE:BEGIN -->"
     $EndMarker = "<!-- PROJECTRELEASE:END -->"
 
@@ -2297,6 +2301,10 @@ function Get-UpdatedReadmeContent
         Stop-ProjectRelease "README.md could not be read."
     }
 
+    if ($null -eq $Readme) {
+        $Readme = ""
+    }
+
     $BeginMarker = "<!-- PROJECTRELEASE:BEGIN -->"
     $EndMarker = "<!-- PROJECTRELEASE:END -->"
 
@@ -3446,7 +3454,7 @@ function Publish-ProjectRelease
     }
     catch
     {
-        Stop-ProjectRelease $_.Exception.Message
+        Stop-ProjectRelease ("{0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
     }
     finally
     {
@@ -3986,7 +3994,7 @@ try
 }
 catch
 {
-    Stop-ProjectRelease $_.Exception.Message
+    Stop-ProjectRelease ($_ | Out-String)
 }
 
 #endregion Main
