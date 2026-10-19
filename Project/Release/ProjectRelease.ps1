@@ -1326,6 +1326,7 @@ function Read-JsonFile
     {
         $Content = Get-Content `
             -LiteralPath $Path `
+            -Encoding UTF8 `
             -Raw `
             -ErrorAction Stop
 
@@ -2006,7 +2007,7 @@ function Set-ServiceWorkerVersion
         return $false
     }
 
-    $Content = Get-Content -LiteralPath $Path -Raw
+    $Content = Get-Content -LiteralPath $Path -Encoding UTF8 -Raw
     $Original = $Content
     $Lines = $Content -split "`r?`n"
 
@@ -2145,7 +2146,7 @@ function Get-ServiceWorkerReportedVersion
         return $null
     }
 
-    foreach ($Line in (Get-Content -LiteralPath $Path))
+    foreach ($Line in (Get-Content -LiteralPath $Path -Encoding UTF8))
     {
         if ($Line -match '(?i)(cache|version)' -and
             $Line -match '(?<Version>\d+\.\d+\.\d+)')
@@ -2293,6 +2294,7 @@ function Get-UpdatedReadmeContent
     {
         $Readme = Get-Content `
             -LiteralPath $ReadmePath `
+            -Encoding UTF8 `
             -Raw `
             -ErrorAction Stop
     }
@@ -3267,7 +3269,7 @@ function Ensure-GitIgnoreEntry
 
     if (Test-Path -LiteralPath $GitIgnorePath -PathType Leaf)
     {
-        $Lines = @(Get-Content -LiteralPath $GitIgnorePath)
+        $Lines = @(Get-Content -LiteralPath $GitIgnorePath -Encoding UTF8)
     }
 
     if ($Lines -contains $Entry)
@@ -3998,3 +4000,4 @@ catch
 }
 
 #endregion Main
+
