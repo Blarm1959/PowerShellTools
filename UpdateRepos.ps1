@@ -49,24 +49,34 @@
 .PARAMETER NoFetch
     Skip 'git fetch' (only sensible with -L).
 
+.PARAMETER Tidy
+    Remove safe detached linked worktrees under Root. Alias: -T.
+    Skips worktrees with changes, ignored files or commits not on a known
+    remote branch. Run separately on each laptop.
+
 .EXAMPLE
     .\UpdateRepos.ps1
 
 .EXAMPLE
     .\UpdateRepos.ps1 -L
+
+.EXAMPLE
+    .\UpdateRepos.ps1 -T
 #>
 
 [CmdletBinding()]
 param(
     [Alias('List')]
     [switch]$L,
+    [Alias('T')]
+    [switch]$Tidy,
     [string]$Root,
     [string]$Owner,
     [string[]]$Exclude = @('* - Copy'),
     [switch]$NoFetch
 )
 
-$ScriptVersion = '1.2.2'   # Prints optional GitHub Desktop reset instructions; never executes the reset.
+$ScriptVersion = '1.3.0'
 
 $U = -not $L
 
@@ -92,6 +102,77 @@ if (-not $Root) {
 if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
     Write-Host "[FAIL] Repos folder not found: $Root" -ForegroundColor Red
     exit 1
+}
+
+# Tidy only detached, linked worktrees directly under the repositories folder.
+# The main checkout and ordinary detached clones are never removed.
+if ($Tidy) {
+    if ($L -or $NoFetch) {
+        Write-Host '[FAIL] -Tidy cannot be combined with -L or -NoFetch.' -ForegroundColor Red
+        exit 1
+    }
+    $seen = @{}
+    $removed = 0
+    $skippedTidy = 0
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    foreach ($folder in @(Get-ChildItem -LiteralPath $Root -Directory | Sort-Object Name)) {
+        if (-not (Test-Path -LiteralPath (Join-Path $folder.FullName '.git'))) { continue }
+        $lines = @(git -C $folder.FullName worktree list --porcelain 2>$null)
+        if ($LASTEXITCODE -ne 0) { continue }
+        $entries = @()
+        $entry = $null
+        foreach ($line in ($lines + '')) {
+            if (-not $line) {
+                if ($entry) { $entries += $entry; $entry = $null }
+            }
+            elseif ($line -like 'worktree *') {
+                $entry = @{ Path = $line.Substring(9); Head = ''; Detached = $false; Locked = $false; Prunable = $false }
+            }
+            elseif ($entry -and $line -like 'HEAD *') { $entry.Head = $line.Substring(5) }
+            elseif ($entry -and $line -eq 'detached') { $entry.Detached = $true }
+            elseif ($entry -and $line -match '^locked(?: |$)') { $entry.Locked = $true }
+            elseif ($entry -and $line -match '^prunable(?: |$)') { $entry.Prunable = $true }
+        }
+        if ($entries.Count -lt 2) { continue }
+        $main = $entries[0].Path
+        foreach ($item in $entries | Select-Object -Skip 1) {
+            if (-not $item.Detached) { continue }
+            $path = [IO.Path]::GetFullPath($item.Path)
+            if ($seen.ContainsKey($path)) { continue }
+            $seen[$path] = $true
+            $parent = [IO.Path]::GetDirectoryName($path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+            $reason = ''
+            if ($parent -ine $rootFull) { $reason = 'outside the repositories folder' }
+            elseif ($item.Locked -or $item.Prunable) { $reason = 'locked or missing worktree' }
+            elseif (-not (Test-Path -LiteralPath $path -PathType Container)) { $reason = 'folder missing' }
+            elseif ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { $reason = 'folder is a link' }
+            else {
+                $status = @(git -C $path status --porcelain --untracked-files=all --ignored 2>$null)
+                if ($LASTEXITCODE -ne 0 -or $status.Count) { $reason = 'changes, untracked or ignored files, or status unavailable' }
+                else {
+                    $published = @(git -C $main branch -r --contains $item.Head 2>$null)
+                    if ($LASTEXITCODE -ne 0 -or $published.Count -eq 0) { $reason = 'commit not found on a known remote branch' }
+                }
+            }
+            if ($reason) {
+                Write-Host "[SKIP] $path - $reason" -ForegroundColor Yellow
+                $skippedTidy++
+                continue
+            }
+            $output = @(git -C $main worktree remove -- $path 2>&1)
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "[REMOVED] $path" -ForegroundColor Green
+                $removed++
+            }
+            else {
+                Write-Host "[SKIP] $path - Git could not remove it: $($output -join ' ')" -ForegroundColor Yellow
+                $skippedTidy++
+            }
+        }
+    }
+    Write-Host "Tidy complete: $removed removed, $skippedTidy skipped."
+    if ($skippedTidy) { exit 1 }
+    exit 0
 }
 
 function Get-GitHubName {
@@ -512,6 +593,10 @@ Write-Host '  This clears the old local repository list without deleting your Gi
 Write-Host '  It also resets other GitHub Desktop state stored in IndexedDB.'
 Write-Host '  UpdateRepos has NOT run the reset command.'
 Write-Host ''
+Write-Host 'To tidy detached HEAD worktrees on this laptop, run UpdateRepos -Tidy (or UpdateRepos -T).' -ForegroundColor Cyan
+Write-Host 'Eligible detached worktree folders will be deleted; worktrees with changes, untracked or ignored files, or unverified commits are skipped.' -ForegroundColor Yellow
+Write-Host ''
 if ($needAction.Count -or $missing.Count -or $inventoryIssues.Count -or $nonGitFolders.Count -or $scope -ne 'all') { exit 1 }
 exit 0
+
 
