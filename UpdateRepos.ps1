@@ -50,7 +50,9 @@
     Skip 'git fetch' (only sensible with -L).
 
 .PARAMETER Tidy
-    Remove safe detached linked worktrees under Root. Alias: -T.
+    Remove safe detached linked worktrees from the latest report. Alias: -T.
+    Use -T <numbers> for selected items or -T for all eligible items.
+    A list is shown and confirmation required before removal.
     Skips worktrees with changes, ignored files or commits not on a known
     remote branch. Run separately on each laptop.
 
@@ -62,6 +64,12 @@
 
 .EXAMPLE
     .\UpdateRepos.ps1 -T
+
+.EXAMPLE
+    .\UpdateRepos.ps1 -T 2
+
+.EXAMPLE
+    .\UpdateRepos.ps1 -T 2,6,7
 #>
 
 [CmdletBinding()]
@@ -70,13 +78,15 @@ param(
     [switch]$L,
     [Alias('T')]
     [switch]$Tidy,
+    [Parameter(Position=0)]
+    [int[]]$Number,
     [string]$Root,
     [string]$Owner,
     [string[]]$Exclude = @('* - Copy'),
     [switch]$NoFetch
 )
 
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.4.0'
 
 $U = -not $L
 
@@ -104,76 +114,95 @@ if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
     exit 1
 }
 
-# Tidy only detached, linked worktrees directly under the repositories folder.
-# The main checkout and ordinary detached clones are never removed.
+if (-not $env:LOCALAPPDATA) {
+    Write-Host '[FAIL] LOCALAPPDATA is unavailable; the numbered report cannot be stored safely.' -ForegroundColor Red
+    exit 1
+}
+$snapshotPath = Join-Path $env:LOCALAPPDATA 'Blarm1959\UpdateRepos\last-report.json'
+$rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+if ($PSBoundParameters.ContainsKey('Number') -and -not $Tidy) {
+    Write-Host '[FAIL] A number requires -T.' -ForegroundColor Red
+    exit 1
+}
 if ($Tidy) {
-    if ($L -or $NoFetch) {
-        Write-Host '[FAIL] -Tidy cannot be combined with -L or -NoFetch.' -ForegroundColor Red
-        exit 1
+    if ($L -or $NoFetch -or ($Number | Where-Object { $_ -lt 1 }).Count -gt 0) { Write-Host '[FAIL] Invalid tidy options.' -ForegroundColor Red; exit 1 }
+    try {
+        $snapshot = Get-Content -LiteralPath $snapshotPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($snapshot.Schema -ne 1 -or $snapshot.Root -ine $rootFull) { throw 'Report does not match this repositories folder.' }
+        $items = @($snapshot.Items)
     }
-    $seen = @{}
-    $removed = 0
-    $skippedTidy = 0
-    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    foreach ($folder in @(Get-ChildItem -LiteralPath $Root -Directory | Sort-Object Name)) {
-        if (-not (Test-Path -LiteralPath (Join-Path $folder.FullName '.git'))) { continue }
-        $lines = @(git -C $folder.FullName worktree list --porcelain 2>$null)
-        if ($LASTEXITCODE -ne 0) { continue }
-        $entries = @()
-        $entry = $null
-        foreach ($line in ($lines + '')) {
-            if (-not $line) {
-                if ($entry) { $entries += $entry; $entry = $null }
-            }
-            elseif ($line -like 'worktree *') {
-                $entry = @{ Path = $line.Substring(9); Head = ''; Detached = $false; Locked = $false; Prunable = $false }
-            }
-            elseif ($entry -and $line -like 'HEAD *') { $entry.Head = $line.Substring(5) }
-            elseif ($entry -and $line -eq 'detached') { $entry.Detached = $true }
-            elseif ($entry -and $line -match '^locked(?: |$)') { $entry.Locked = $true }
-            elseif ($entry -and $line -match '^prunable(?: |$)') { $entry.Prunable = $true }
+    catch { Write-Host '[FAIL] No valid matching report. Run UpdateRepos first.' -ForegroundColor Red; exit 1 }
+    if ($PSBoundParameters.ContainsKey('Number')) {
+        if (-not $Number -or @($Number | Where-Object { $_ -lt 1 }).Count) { Write-Host '[FAIL] Enter positive report numbers.' -ForegroundColor Red; exit 1 }
+        $targets = @()
+        foreach ($n in @($Number | Select-Object -Unique)) {
+            $matchNumber = @($items | Where-Object { $_.Number -eq $n })
+            if ($matchNumber.Count -ne 1) { Write-Host "[FAIL] Number $n not found in the last report." -ForegroundColor Red; exit 1 }
+            $targets += $matchNumber[0]
         }
-        if ($entries.Count -lt 2) { continue }
-        $main = $entries[0].Path
-        foreach ($item in $entries | Select-Object -Skip 1) {
-            if (-not $item.Detached) { continue }
-            $path = [IO.Path]::GetFullPath($item.Path)
-            if ($seen.ContainsKey($path)) { continue }
-            $seen[$path] = $true
-            $parent = [IO.Path]::GetDirectoryName($path).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-            $reason = ''
-            if ($parent -ine $rootFull) { $reason = 'outside the repositories folder' }
-            elseif ($item.Locked -or $item.Prunable) { $reason = 'locked or missing worktree' }
-            elseif (-not (Test-Path -LiteralPath $path -PathType Container)) { $reason = 'folder missing' }
-            elseif ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { $reason = 'folder is a link' }
-            else {
+    }
+    else { $targets = @($items | Where-Object { $_.Detached }) }
+    $removed = 0; $skipped = 0; $approved = @()
+    foreach ($phase in @('preview', 'execute')) {
+    $eligible = 0
+    foreach ($item in $targets) {
+        if ($phase -eq 'execute' -and $approved -notcontains $item.Number) { continue }
+        $path = Join-Path $rootFull $item.Repo
+        $reason = ''
+        if (-not $item.Detached) { $reason = 'not a detached worktree' }
+        elseif ($item.Repo -ne [IO.Path]::GetFileName($item.Repo) -or -not $item.Head -or -not $item.Origin) { $reason = 'invalid report entry' }
+        elseif (-not (Test-Path -LiteralPath $path -PathType Container)) { $reason = 'folder missing' }
+        elseif ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { $reason = 'folder is a link' }
+        else {
+            $currentHead = git -C $path rev-parse --verify HEAD 2>$null
+            if ($LASTEXITCODE -ne 0 -or $currentHead -ne $item.Head) { $reason = 'HEAD changed since the report' }
+            $branch = git -C $path symbolic-ref --quiet --short HEAD 2>$null
+            if (-not $reason -and $branch) { $reason = 'worktree is no longer detached' }
+            $origin = git -C $path remote get-url origin 2>$null
+            if (-not $reason -and $origin -ne $item.Origin) { $reason = 'origin changed since the report' }
+            $lines = @(git -C $path worktree list --porcelain 2>$null)
+            if (-not $reason -and $LASTEXITCODE -ne 0) { $reason = 'could not inspect worktrees' }
+            $entries = @(); $entry = $null
+            foreach ($line in ($lines + '')) {
+                if (-not $line) { if ($entry) { $entries += $entry; $entry = $null } }
+                elseif ($line -like 'worktree *') { $entry = @{ Path=$line.Substring(9); Head=''; Detached=$false; Locked=$false } }
+                elseif ($entry -and $line -like 'HEAD *') { $entry.Head=$line.Substring(5) }
+                elseif ($entry -and $line -eq 'detached') { $entry.Detached=$true }
+                elseif ($entry -and $line -match '^(locked|prunable)( |$)') { $entry.Locked=$true }
+            }
+            $match = @($entries | Select-Object -Skip 1 | Where-Object { [IO.Path]::GetFullPath($_.Path) -ieq [IO.Path]::GetFullPath($path) -and $_.Head -eq $item.Head -and $_.Detached -and -not $_.Locked })
+            if (-not $reason -and ($entries.Count -lt 2 -or $match.Count -ne 1)) { $reason = 'not a removable linked worktree' }
+            if (-not $reason) {
                 $status = @(git -C $path status --porcelain --untracked-files=all --ignored 2>$null)
                 if ($LASTEXITCODE -ne 0 -or $status.Count) { $reason = 'changes, untracked or ignored files, or status unavailable' }
-                else {
-                    $published = @(git -C $main branch -r --contains $item.Head 2>$null)
-                    if ($LASTEXITCODE -ne 0 -or $published.Count -eq 0) { $reason = 'commit not found on a known remote branch' }
-                }
             }
-            if ($reason) {
-                Write-Host "[SKIP] $path - $reason" -ForegroundColor Yellow
-                $skippedTidy++
-                continue
-            }
-            $output = @(git -C $main worktree remove -- $path 2>&1)
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "[REMOVED] $path" -ForegroundColor Green
-                $removed++
-            }
-            else {
-                Write-Host "[SKIP] $path - Git could not remove it: $($output -join ' ')" -ForegroundColor Yellow
-                $skippedTidy++
+            if (-not $reason) {
+                $published = @(git -C $entries[0].Path branch -r --contains $item.Head 2>$null)
+                if ($LASTEXITCODE -ne 0 -or $published.Count -eq 0) { $reason = 'commit not found on a known remote branch' }
             }
         }
+        if ($reason) { Write-Host "[SKIP] $($item.Number): $($item.Repo) - $reason" -ForegroundColor Yellow; $skipped++; continue }
+        if ($phase -eq 'preview') {
+            Write-Host "[REMOVE] $($item.Number): $path" -ForegroundColor Yellow
+            $approved += $item.Number
+            $eligible++
+            continue
+        }
+        $output = @(git -C $entries[0].Path worktree remove -- $path 2>&1)
+        if ($LASTEXITCODE -eq 0) { Write-Host "[REMOVED] $($item.Number): $path" -ForegroundColor Green; $removed++ }
+        else { Write-Host "[SKIP] $($item.Number): $path - $($output -join ' ')" -ForegroundColor Yellow; $skipped++ }
     }
-    Write-Host "Tidy complete: $removed removed, $skippedTidy skipped."
-    if ($skippedTidy) { exit 1 }
-    exit 0
+    if ($phase -eq 'preview') {
+        if (-not $eligible) { Write-Host 'No eligible worktrees to remove.'; if ($skipped) { exit 1 }; exit 0 }
+        $answer = Read-Host 'Delete the listed worktree folders? Type YES to confirm'
+        if ($answer -ine 'YES') { Write-Host 'Cancelled; no folders removed.'; exit 0 }
+        $skipped = 0
+    }
+    }
+    Write-Host "Tidy complete: $removed removed, $skipped skipped."
+    if ($skipped) { exit 1 }; exit 0
 }
+
 
 function Get-GitHubName {
     param([string]$Url)
@@ -492,19 +521,42 @@ if ($null -ne $remoteNames) {
 # ------------------------------------------------------------
 
 $results = @($results | Sort-Object Repo)
+$reportItems = @()
+$index = 0
+foreach ($result in $results) {
+    $index++
+    $result | Add-Member -NotePropertyName Number -NotePropertyValue $index
+    $reportPath = Join-Path $rootFull $result.Repo
+    $reportHead = git -C $reportPath rev-parse --verify HEAD 2>$null
+    if ($LASTEXITCODE -ne 0) { $reportHead = '' }
+    $reportOrigin = git -C $reportPath remote get-url origin 2>$null
+    if ($LASTEXITCODE -ne 0) { $reportOrigin = '' }
+    $reportItems += [pscustomobject]@{ Number=$index; Repo=$result.Repo; Detached=($result.Status -match 'Detached HEAD'); Head="$reportHead"; Origin="$reportOrigin" }
+}
+try {
+    $snapshotDir = Split-Path -Parent $snapshotPath
+    New-Item -ItemType Directory -Path $snapshotDir -Force -ErrorAction Stop | Out-Null
+    $snapshot = [pscustomobject]@{ Schema=1; Root=$rootFull; Items=@($reportItems) }
+    $json = $snapshot | ConvertTo-Json -Depth 5
+    [IO.File]::WriteAllText($snapshotPath, $json, [Text.UTF8Encoding]::new($false))
+}
+catch {
+    Remove-Item -LiteralPath $snapshotPath -Force -ErrorAction SilentlyContinue
+    Write-Host '[WARN] Could not save the numbered report; -T will be unavailable.' -ForegroundColor Yellow
+}
 
 $nameWidth   = [math]::Max(4, ($results | ForEach-Object { $_.Repo.Length } | Measure-Object -Maximum).Maximum)
 $branchWidth = [math]::Max(6, ($results | ForEach-Object { "$($_.Branch)".Length } | Measure-Object -Maximum).Maximum)
 
-Write-Host ('{0}  {1}  {2}' -f 'Repo'.PadRight($nameWidth), 'Branch'.PadRight($branchWidth), 'Status')
-Write-Host ('{0}  {1}  {2}' -f ('-' * $nameWidth), ('-' * $branchWidth), ('-' * 6))
+Write-Host ('{0,4}  {1}  {2}  {3}' -f 'No.', 'Repo'.PadRight($nameWidth), 'Branch'.PadRight($branchWidth), 'Status')
+Write-Host ('{0,4}  {1}  {2}  {3}' -f '----', ('-' * $nameWidth), ('-' * $branchWidth), ('-' * 6))
 
 foreach ($r in $results) {
     $colour = 'Green'
     if (-not $r.OK) { $colour = 'Yellow' }
     if ($r.Status -match 'BEHIND|DIVERGED|FAILED|gone') { $colour = 'Red' }
     elseif ($r.OK -and $r.Updated) { $colour = 'Cyan' }
-    Write-Host ('{0}  {1}  {2}' -f $r.Repo.PadRight($nameWidth), "$($r.Branch)".PadRight($branchWidth), $r.Status) -ForegroundColor $colour
+    Write-Host ('{0,4}  {1}  {2}  {3}' -f $r.Number, $r.Repo.PadRight($nameWidth), "$($r.Branch)".PadRight($branchWidth), $r.Status) -ForegroundColor $colour
 }
 
 $needAction = @($results | Where-Object { -not $_.OK })
@@ -593,10 +645,11 @@ Write-Host '  This clears the old local repository list without deleting your Gi
 Write-Host '  It also resets other GitHub Desktop state stored in IndexedDB.'
 Write-Host '  UpdateRepos has NOT run the reset command.'
 Write-Host ''
-Write-Host 'To tidy detached HEAD worktrees on this laptop, run UpdateRepos -Tidy (or UpdateRepos -T).' -ForegroundColor Cyan
+Write-Host 'Run UpdateRepos -T 2,6,7 for selected items, or UpdateRepos -T for all eligible items; confirmation is required.' -ForegroundColor Cyan
 Write-Host 'Eligible detached worktree folders will be deleted; worktrees with changes, untracked or ignored files, or unverified commits are skipped.' -ForegroundColor Yellow
 Write-Host ''
 if ($needAction.Count -or $missing.Count -or $inventoryIssues.Count -or $nonGitFolders.Count -or $scope -ne 'all') { exit 1 }
 exit 0
+
 
 
